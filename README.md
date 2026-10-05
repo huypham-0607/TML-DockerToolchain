@@ -1,86 +1,294 @@
 # TML-DockerToolchain
-## Background: Landseer
-- Broader motivation: containerizing trustworthy-ML (TML) repositories is difficult
-- Manual environment reconstruction is slow and error-prone; goal is automated containerization
-- Development is ongoing
-## Project Scope
-- Team 1 is responsible only for automated containerization infrastructure for TML research repositories
-- Goal: transform a repository into a validated Docker environment for downstream teams
-  - Use cases: benchmark modification, experiment reproduction, metric validation
-- Core pipeline:
-  1. Research Repository
-  2. Dockerfile
-  3. Docker Image
-  4. Running Container
-  5. Generic command-execution interface
-- A generated Dockerfile is considered successful only if it actually builds and starts
-## Status: Implementing Repo exploratory:
 
-Repository inspection:
-Abstract: inspect repository structure, dependency files, README setup instructions, Python/CUDA/framework versions, existing Docker configuration, and relevant environment metadata.
+Automated containerization infrastructure for trustworthy machine learning (TML) research repositories.
+The toolchain changes a research repository into a validated Docker environment.
+
+> **Note:** Development is ongoing. Most of the design in this document is not implemented at this time. Refer to [Status](#status).
+
+## Contents
+
+- [Background: Landseer](#background-landseer)
+- [Project Scope](#project-scope)
+- [Setup](#setup)
+- [Status](#status)
+- [Agent Toolchain Categories](#agent-toolchain-categories)
+- [Agent Workflow](#agent-workflow)
+- [Project Layout](#project-layout)
+- [Important Design Decisions](#important-design-decisions)
+- [Next Steps](#next-steps)
+
+## Background: Landseer
+
+- Broader motivation: it is difficult to containerize TML repositories.
+- Manual reconstruction of an environment is slow and causes errors.
+- The goal is automated containerization.
+- Development is ongoing.
+
+## Project Scope
+
+- Team 1 is responsible only for the automated containerization infrastructure for TML research repositories.
+- Goal: change a repository into a validated Docker environment for the downstream teams.
+- The downstream teams use the environment for these tasks:
+  - Benchmark modification
+  - Experiment reproduction
+  - Metric validation
+- A generated Dockerfile is successful only if the image builds and the container starts.
+
+### Core Pipeline
+
+1. Research repository
+2. Dockerfile
+3. Docker image
+4. Running container
+5. Generic command-execution interface
+
+## Setup
+
+### Prerequisites
+
+| Item | Requirement | Purpose |
+| --- | --- | --- |
+| [uv](https://docs.astral.sh/uv/getting-started/installation/) | A recent version | Installs Python and the dependencies. |
+| Python | 3.14 or later | uv installs this version automatically if it is not on your computer. |
+| Purdue GenAI API key | A key for `genai.rcac.purdue.edu` | The agent uses this service for the LLM. |
+| Docker | A recent version | Necessary for the planned pipeline. The current code does not call Docker. |
+
+### Install
+
+1. Clone the repository.
+
+   ```bash
+   git clone https://github.com/huypham-0607/TML-DockerToolchain.git
+   cd TML-DockerToolchain
+   ```
+
+2. Install the dependencies. This command makes the `.venv/` directory.
+
+   ```bash
+   uv sync
+   ```
+
+### Set the Environment Variables
+
+1. Make a file with the name `.env` in the repository root.
+2. Add the variables to the file.
+
+   ```bash
+   export GENAI_API_KEY="<your Purdue GenAI API key>"
+   export LANGSMITH_TRACING="true"
+   export LANGSMITH_API_KEY="<your LangSmith API key>"
+   ```
+
+3. Load the variables into your shell. The code does not read `.env` automatically.
+
+   ```bash
+   source .env
+   ```
+
+| Variable | Necessary | Purpose |
+| --- | --- | --- |
+| `GENAI_API_KEY` | Yes | `src/agent.py` reads this key for the Purdue GenAI API. |
+| `LANGSMITH_TRACING` | No | Set to `true` to record LangSmith traces. |
+| `LANGSMITH_API_KEY` | No | Necessary only if LangSmith tracing is on. |
+
+> **Caution:** Do not commit `.env`. Git ignores this file.
+
+### Run
+
+- Do a check of the installation. This command prints `Hello from tml-dockertoolchain!`.
+
+  ```bash
+  uv run main.py
+  ```
+
+- Start the placeholder agent with a question. If you give no question, the agent uses `Hello world!`.
+  The agent prints its last reply.
+
+  ```bash
+  uv run python -m src.main "your question"
+  ```
+
+## Status
+
+Current work: repository exploration (repository inspection).
+
+### Repository Inspection
+
+Abstract: inspect these items in a repository:
+
+- Repository structure
+- Dependency files
+- README setup instructions
+- Python, CUDA, and framework versions
+- Existing Docker configuration
+- Relevant environment metadata
 
 Sections:
 
-- A — Repository StructureFile tree, languages, important files, existing Docker configrepo/structure.py
-- B — Dependency Detection requirements.txt, pyproject.toml, environment.yml, setup.py, package versionsrepo/dependencies.py
-- C — Documentation / SearchREADME setup extraction, installation commands, optional Google search fallbackrepo/documentation.py
-- D — Environment DetectionPython, CUDA, PyTorch/TensorFlow versions; combine evidence from code/config/docsrepo/environment.py
+| Section | Name | Scope | Module |
+| --- | --- | --- | --- |
+| A | Repository Structure | File tree, languages, important files, existing Docker configuration | `repo/structure.py` |
+| B | Dependency Detection | `requirements.txt`, `pyproject.toml`, `environment.yml`, `setup.py`, package versions | `repo/dependencies.py` |
+| C | Documentation / Search | README setup extraction, installation commands, optional Google search fallback | `repo/documentation.py` |
+| D | Environment Detection | Python, CUDA, and PyTorch/TensorFlow versions. Combine the evidence from code, configuration, and documentation. | `repo/environment.py` |
+
+### Current Code
+
+The agent and the tools in `src/` are placeholders at this time.
+
+| File | State |
+| --- | --- |
+| `main.py` | Placeholder. Prints a greeting. |
+| `src/main.py` | Command-line entry point. Sends one question to the agent and prints the last reply. |
+| `src/agent.py` | Placeholder. Makes the agent with `deepagents`. Uses the model `gpt-oss:120b` through the Purdue GenAI API. The rate limit is 2 requests each second. The system prompt and the tool list are placeholders. |
+| `src/tools.py` | Placeholder. Contains two temporary tools: `meow` and `woof`. Each tool returns a fixed string. |
+| `pyproject.toml`, `uv.lock`, `.python-version` | Project metadata, locked dependencies, and the Python version. |
+
+These parts of the design are not in the repository at this time:
+
+- Repository inspection modules (sections A to D)
+- Dockerization, container lifecycle, and container execution
+- Dockerfile templates
+- Schemas for the structured return objects
+- Tests
 
 ## Agent Toolchain Categories
-- Repository inspection
-  - Repository structure, dependency files, README setup instructions
-  - Python/CUDA/framework versions, existing Docker configuration, environment metadata
-- Dockerization
-  - Generate/select a Dockerfile template
-  - Build the Docker image, inspect build failures, repair and retry until success or retry limit
-- Container lifecycle
-  - Provision/start a container from an image, check status, stop, and remove
-- Container execution
-  - Execute arbitrary commands inside a provisioned container
-  - Return structured results: stdout, stderr, exit code, timeout status
-- Main LLM-facing tools should remain high-level:
-  - dockerize_repo(repo)
-  - build_image(dockerfile) (possibly internal to dockerize_repo())
-  - provision_container(image, name)
-  - run_command_in_container(container, cmd)
-  - destroy_container(container)
-- Lower-level helpers (dependency detection, log parsing) stay as ordinary Python functions, not agent tools
+
+| Category | Functions |
+| --- | --- |
+| Repository inspection | Inspect the repository structure, dependency files, and README setup instructions. Inspect the Python, CUDA, and framework versions, the existing Docker configuration, and the environment metadata. |
+| Dockerization | Generate or select a Dockerfile template. Build the Docker image. Inspect build failures. Repair and try again until the build is successful or the retry limit is reached. |
+| Container lifecycle | Provision and start a container from an image. Check the status. Stop the container. Remove the container. |
+| Container execution | Execute arbitrary commands in a provisioned container. Return structured results: stdout, stderr, exit code, and timeout status. |
+
+### LLM-Facing Tools
+
+Keep the main LLM-facing tools high-level:
+
+- `dockerize_repo(repo)`
+- `build_image(dockerfile)` (possibly internal to `dockerize_repo()`)
+- `provision_container(image, name)`
+- `run_command_in_container(container, cmd)`
+- `destroy_container(container)`
+
+### Lower-Level Helpers
+
+Lower-level helpers stay as ordinary Python functions. They are not agent tools.
+Examples: dependency detection and log parsing.
+
 ## Agent Workflow
-1. Inspect repository
-2. Infer software/environment requirements
-3. Select Dockerfile template
-4. Generate Dockerfile
-5. Build Docker image
-6. If build fails: read logs → diagnose → modify Dockerfile → rebuild (fixed retry limit)
-7. Provision container
-8. Run basic smoke tests/commands
-9. Return validated container artifact
-- Key split: LLM handles reasoning and repair decisions; deterministic Python/Docker code performs actual container operations
-- Smoke tests are essential: need to validate not just that the container builds, but that basic functions actually run
-  - Example risk: IPmix hardcoded CUDA, breaking environments without a GPU; similar issues could recur
+
+1. Inspect the repository.
+2. Infer the software and environment requirements.
+3. Select a Dockerfile template.
+4. Generate the Dockerfile.
+5. Build the Docker image.
+6. If the build fails, do these steps again until the fixed retry limit:
+   1. Read the logs.
+   2. Diagnose the failure.
+   3. Modify the Dockerfile.
+   4. Build the image again.
+7. Provision the container.
+8. Run basic smoke tests and commands.
+9. Return the validated container artifact.
+
+### Key Split
+
+- The LLM does the reasoning and makes the repair decisions.
+- Deterministic Python and Docker code does the container operations.
+
+### Smoke Tests
+
+- Smoke tests are essential.
+- A successful build is not sufficient. The tests must also show that the basic functions run.
+- Example risk: IPmix hardcoded CUDA. This broke environments that have no GPU. Similar problems can occur again.
+
 ## Project Layout
-- Proposed repository structure for container-agent/:
-  - src/agent/: https://agent.py, https://prompts.py, https://state.py
-  - src/repo/: https://inspect.py, https://dependencies.py, https://setup_parser.py
-  - src/docker/: https://dockerize.py, https://build.py, https://provision.py, https://exec.py, https://lifecycle.py
-  - src/schemas/: https://repository.py, https://build.py, https://container.py
-  - templates/: https://python.do, https://conda.do, https://pytorch-cuda.do
-  - tests/, runs/, https://pyproject.to
+
+### Current Layout
+
+```text
+TML-DockerToolchain/
+├── .gitignore
+├── .python-version
+├── README.md
+├── main.py
+├── pyproject.toml
+├── uv.lock
+└── src/
+    ├── __init__.py
+    ├── agent.py
+    ├── main.py
+    └── tools.py
+```
+
+### Proposed Layout
+
+Proposed repository structure for `container-agent/`:
+
+```text
+container-agent/
+├── src/
+│   ├── agent/
+│   │   ├── agent.py
+│   │   ├── prompts.py
+│   │   └── state.py
+│   ├── repo/
+│   │   ├── inspect.py
+│   │   ├── dependencies.py
+│   │   └── setup_parser.py
+│   ├── docker/
+│   │   ├── dockerize.py
+│   │   ├── build.py
+│   │   ├── provision.py
+│   │   ├── exec.py
+│   │   └── lifecycle.py
+│   └── schemas/
+│       ├── repository.py
+│       ├── build.py
+│       └── container.py
+├── templates/
+│   ├── python.dockerfile
+│   ├── conda.dockerfile
+│   └── pytorch-cuda.dockerfile
+├── tests/
+├── runs/
+└── pyproject.toml
+```
+
 ## Important Design Decisions
-- Team boundary is explicit: Team 1 produces the environment; it does not determine which experiment to run or whether a paper metric was reproduced
-  - run_command_in_container() is a generic execution primitive for other teams
-- Use structured return objects over raw text
-  - RepoProfile, BuildResult, ContainerHandle, CommandResult
-  - Makes LangChain tool calls more reliable and gives downstream teams stable interfaces
-- First milestone success definition (simple):
-  - Repository → Dockerfile → successful image build → container starts → arbitrary command executes
-- Docker first, Apptainer later
-  - Do everything in Docker first, then migrate to Apptainer for RCAC/Purdue SLURM support
-  - Future path: Repository → Dockerfile → Docker/OCI Image → Apptainer/SIF → RCAC
-  - Team 1 does not take responsibility for SLURM jobs, experiment reproduction, or metric validation
-- Container quality will vary significantly across teams; inter-team communication and responsibility splits need strengthening
+
+### The Team Boundary Is Explicit
+
+- Team 1 produces the environment.
+- Team 1 does not decide which experiment to run.
+- Team 1 does not decide if a paper metric was reproduced.
+- `run_command_in_container()` is a generic execution primitive for the other teams.
+
+### Use Structured Return Objects, Not Raw Text
+
+- Objects: `RepoProfile`, `BuildResult`, `ContainerHandle`, `CommandResult`
+- Structured objects make LangChain tool calls more reliable.
+- Structured objects give the downstream teams stable interfaces.
+
+### First Milestone Success Definition (Simple)
+
+Repository → Dockerfile → successful image build → container starts → arbitrary command executes
+
+### Docker First, Apptainer Later
+
+- Do all the work in Docker first.
+- Then migrate to Apptainer for RCAC/Purdue SLURM support.
+- Future path: Repository → Dockerfile → Docker/OCI image → Apptainer/SIF → RCAC
+- Team 1 is not responsible for SLURM jobs, experiment reproduction, or metric validation.
+
+### Inter-Team Coordination
+
+- Container quality will be significantly different from team to team.
+- Inter-team communication and the split of responsibilities must become stronger.
+
 ## Next Steps
-- **Write smoke tests for container validation**
-- **Implement first set of toolchains for repository inspection**
-- **Share Claude chat link for review**
----
+
+- **Write smoke tests for container validation.**
+- **Implement the first set of toolchains for repository inspection.**
+- **Share the Claude chat link for review.**
