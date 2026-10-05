@@ -14,6 +14,18 @@
   4. Running Container
   5. Generic command-execution interface
 - A generated Dockerfile is considered successful only if it actually builds and starts
+## Status: Implementing Repo exploratory:
+
+Repository inspection:
+Abstract: inspect repository structure, dependency files, README setup instructions, Python/CUDA/framework versions, existing Docker configuration, and relevant environment metadata.
+
+Sections:
+
+- A — Repository StructureFile tree, languages, important files, existing Docker configrepo/structure.py
+- B — Dependency Detection requirements.txt, pyproject.toml, environment.yml, setup.py, package versionsrepo/dependencies.py
+- C — Documentation / SearchREADME setup extraction, installation commands, optional Google search fallbackrepo/documentation.py
+- D — Environment DetectionPython, CUDA, PyTorch/TensorFlow versions; combine evidence from code/config/docsrepo/environment.py
+
 ## Agent Toolchain Categories
 - Repository inspection
   - Repository structure, dependency files, README setup instructions
