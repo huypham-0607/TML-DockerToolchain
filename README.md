@@ -50,7 +50,7 @@ The toolchain changes a research repository into a validated Docker environment.
 | --- | --- | --- |
 | [uv](https://docs.astral.sh/uv/getting-started/installation/) | A recent version | Installs Python and the dependencies. |
 | Python | 3.14 or later | uv installs this version automatically if it is not on your computer. |
-| Purdue GenAI API key | A key for `genai.rcac.purdue.edu` | The agent uses this service for the LLM. |
+| LLM API key | A Purdue GenAI key for `genai.rcac.purdue.edu`, or an OpenAI key from [platform.openai.com](https://platform.openai.com/api-keys) | The agent uses this service for the LLM. Refer to [Select the LLM](#select-the-llm). |
 | Docker | A recent version | Necessary for the planned pipeline. The current code does not call Docker. |
 
 ### Install
@@ -75,23 +75,36 @@ The toolchain changes a research repository into a validated Docker environment.
 
    ```bash
    export GENAI_API_KEY="<your Purdue GenAI API key>"
+   # Optional: use OpenAI instead of Purdue GenAI
+   # export LLM_PROVIDER="openai"
+   # export OPENAI_API_KEY="<your OpenAI API key>"
    export LANGSMITH_TRACING="true"
    export LANGSMITH_API_KEY="<your LangSmith API key>"
    ```
 
-3. Load the variables into your shell. The code does not read `.env` automatically.
-
-   ```bash
-   source .env
-   ```
+3. The agent loads `.env` automatically (`python-dotenv`). Variables that are already set in your shell take priority.
 
 | Variable | Necessary | Purpose |
 | --- | --- | --- |
-| `GENAI_API_KEY` | Yes | `src/agent.py` reads this key for the Purdue GenAI API. |
+| `LLM_PROVIDER` | No | `rcac` (default) or `openai`. |
+| `LLM_MODEL` | No | Overrides the default model of the provider. |
+| `GENAI_API_KEY` | If `LLM_PROVIDER=rcac` (default) | The key for the Purdue GenAI API. |
+| `OPENAI_API_KEY` | If `LLM_PROVIDER=openai` | The key for the OpenAI API. |
 | `LANGSMITH_TRACING` | No | Set to `true` to record LangSmith traces. |
 | `LANGSMITH_API_KEY` | No | Necessary only if LangSmith tracing is on. |
 
 > **Caution:** Do not commit `.env`. Git ignores this file.
+
+### Select the LLM
+
+`src/llm.py` makes the chat model. Set `LLM_PROVIDER` in `.env` to change the provider. You do not have to change the code.
+
+| `LLM_PROVIDER` | Default model | Endpoint | Key |
+| --- | --- | --- | --- |
+| `rcac` (default) | `gpt-oss:120b` | `https://genai.rcac.purdue.edu/api` | `GENAI_API_KEY` |
+| `openai` | `gpt-5-mini` | OpenAI | `OPENAI_API_KEY` |
+
+To add a provider, add an entry to `PROVIDERS` in `src/llm.py`.
 
 ### Run
 
@@ -140,7 +153,8 @@ The agent and the tools in `src/` are placeholders at this time.
 | --- | --- |
 | `main.py` | Placeholder. Prints a greeting. |
 | `src/main.py` | Command-line entry point. Sends one question to the agent and prints the last reply. |
-| `src/agent.py` | Placeholder. Makes the agent with `deepagents`. Uses the model `gpt-oss:120b` through the Purdue GenAI API. The rate limit is 2 requests each second. The system prompt and the tool list are placeholders. |
+| `src/agent.py` | Makes the agent with `deepagents`. Gets the model from `src/llm.py`. |
+| `src/llm.py` | Makes the chat model for the provider in `LLM_PROVIDER` (OpenAI or Purdue GenAI). The rate limit is 2 requests each second. |
 | `src/tools.py` | Placeholder. Contains two temporary tools: `meow` and `woof`. Each tool returns a fixed string. |
 | `pyproject.toml`, `uv.lock`, `.python-version` | Project metadata, locked dependencies, and the Python version. |
 
