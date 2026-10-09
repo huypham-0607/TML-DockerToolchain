@@ -2,7 +2,8 @@
     Fakes for the lifecycle suites that need no Docker daemon.
 
     make_attrs() builds `docker inspect` output; FakeClient stands in for the SDK client
-    (containers.get / containers.list, images.get, ping, info).
+    (containers.get / list, container stop / remove / reload / exec_run, images.get / list / remove,
+    ping, info).
     use_fake(test, fake) makes src.lifecycle.client.get_client() return the fake for one test.
 """
 
@@ -88,13 +89,25 @@ class FakeContainer:
             to each call in turn (the last one repeats).
         after_reload: attrs that reload() switches to, as if the state changed meanwhile;
             an exception makes reload() raise it.
+        stop_exit: exit code the container has after stop() (143 = ended on SIGTERM,
+            137 = needed SIGKILL); an exception makes stop() raise it.
+        stop_oom: stop() also sets OOMKilled.
+        remove_error: an exception that remove() raises.
     """
 
-    def __init__(self, attrs: dict, probe=0, after_reload: dict | Exception | None = None):
+    def __init__(
+        self, attrs: dict, probe=0, after_reload: dict | Exception | None = None,
+        stop_exit: int | Exception = 143, stop_oom: bool = False, remove_error: Exception | None = None,
+    ):
         self.attrs = attrs
         self.probe = probe
         self.after_reload = after_reload
+        self.stop_exit = stop_exit
+        self.stop_oom = stop_oom
+        self.remove_error = remove_error
         self.exec_calls: list = []
+        self.calls: list[tuple] = []        # ("stop", timeout) / ("remove", force, v), in order
+        self.owner: "FakeContainers | None" = None
 
     @property
     def id(self) -> str:
@@ -127,11 +140,37 @@ class FakeContainer:
             raise outcome
         return ExecResult(outcome, b"")
 
+    def stop(self, timeout: int = 10):
+        self.calls.append(("stop", timeout))
+        if isinstance(self.stop_exit, Exception):
+            raise self.stop_exit
+        state = {
+            **self.attrs["State"], "Status": "exited", "Running": False, "Paused": False, "Restarting": False,
+            "Pid": 0, "ExitCode": self.stop_exit, "OOMKilled": self.stop_oom, "FinishedAt": "2026-10-09T10:30:00Z",
+        }
+        self.attrs = {**self.attrs, "State": state}
+
+    def remove(self, force: bool = False, v: bool = False):
+        self.calls.append(("remove", force, v))
+        if self.remove_error:
+            raise self.remove_error
+        if self.owner is not None:
+            self.owner.discard(self)
+
 
 class FakeContainers:
     def __init__(self, containers, error: Exception | None = None):
         self._containers = list(containers)
         self._error = error
+        for c in self._containers:
+            c.owner = self
+
+    def discard(self, container) -> None:
+        if container in self._containers:
+            self._containers.remove(container)
+
+    def names(self) -> list[str]:
+        return [c.name for c in self._containers]
 
     def get(self, key: str):
         if self._error:
@@ -171,11 +210,36 @@ class FakeImage:
 
 
 class FakeImages:
-    """Only the images given to it exist; like lifecycle, it never pulls."""
+    """Only the images given to it exist; like lifecycle, it never pulls.
 
-    def __init__(self, images):
+    `remove_errors` maps a tag (or id) to the exception that remove() raises for it.
+    """
+
+    def __init__(self, images, remove_errors: dict | None = None):
         self._images = list(images)
+        self.remove_errors = remove_errors or {}
         self.get_calls: list[str] = []
+        self.remove_calls: list[tuple] = []     # (tag or id, force)
+
+    def tags(self) -> list[str]:
+        return [tag for image in self._images for tag in image.tags]
+
+    def list(self, filters: dict | None = None):
+        wanted = (filters or {}).get("label", [])
+        wanted = [wanted] if isinstance(wanted, str) else wanted
+        return [image for image in self._images if all_labels_match(image.labels, wanted)]
+
+    def remove(self, name: str, force: bool = False):
+        self.remove_calls.append((name, force))
+        if name in self.remove_errors:
+            raise self.remove_errors[name]
+        for image in self._images:
+            if name in image.tags or name == image.id:
+                image.tags = [t for t in image.tags if t != name]
+                if not image.tags:
+                    self._images.remove(image)
+                return
+        raise docker_errors.ImageNotFound("404 Client Error: Not Found", explanation=f"No such image: {name}")
 
     def get(self, name: str):
         self.get_calls.append(name)
@@ -188,9 +252,12 @@ class FakeImages:
 class FakeClient:
     """SDK DockerClient stand-in. `error` makes every container call raise it."""
 
-    def __init__(self, *containers: FakeContainer, images=(), info: dict | None = None, error: Exception | None = None):
+    def __init__(
+        self, *containers: FakeContainer, images=(), info: dict | None = None,
+        error: Exception | None = None, image_remove_errors: dict | None = None,
+    ):
         self.containers = FakeContainers(containers, error)
-        self.images = FakeImages(images)
+        self.images = FakeImages(images, image_remove_errors)
         self._info = info if info is not None else {"Runtimes": {"runc": {"path": "runc"}}, "MemTotal": 16 * 1024**3}
 
     def ping(self) -> bool:

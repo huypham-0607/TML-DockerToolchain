@@ -4,7 +4,7 @@ import unittest
 from src.lifecycle.models import (
     ERROR_CODES, HEALTH,
     ContainerHandle, ContainerLogs, ContainerSpec, ContainerStatus,
-    Diagnosis, Hint, ImageRef, LifecycleError, ProvisionResult,
+    Diagnosis, Hint, ImageRef, LifecycleError, ProvisionResult, TeardownResult,
 )
 
 
@@ -169,6 +169,25 @@ class TestProvisionResult(unittest.TestCase):
         data = self.result("native", "exited", "failed", diagnosis=diagnosis).to_dict()
         self.assertIs(data["ok"], False)
         self.assertEqual(data["diagnosis"]["status"]["exit_code"], 3)
+
+
+class TestTeardownResult(unittest.TestCase):
+    def test_defaults_mean_nothing_was_done(self):
+        r = TeardownResult(container="c", status=ContainerStatus(container="c", state="exited", health="stopped"))
+        self.assertEqual((r.stopped, r.killed, r.removed, r.exit_code), (False, False, False, None))
+
+    def test_to_dict(self):
+        status = ContainerStatus(container="tml-demo", state="missing", health="missing", reason="removed")
+        result = TeardownResult(container="tml-demo", status=status, stopped=True, killed=True, removed=True, exit_code=137)
+        data = json.loads(result.to_json())
+        self.assertEqual(set(data), {"container", "status", "stopped", "killed", "removed", "exit_code"})
+        self.assertEqual((data["stopped"], data["killed"], data["removed"], data["exit_code"]), (True, True, True, 137))
+        self.assertEqual(data["status"]["reason"], "removed")
+        self.assertIs(data["status"]["usable"], False)           # status keeps its derived fields
+        self.assertIsNone(data["status"]["handle"])
+
+    def test_still_running_is_an_error_code(self):
+        self.assertIn("still_running", ERROR_CODES)
 
 
 class TestLifecycleError(unittest.TestCase):

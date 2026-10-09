@@ -20,8 +20,9 @@ from pathlib import Path
 
 from src.lifecycle import client
 from src.lifecycle.image import ensure_image
-from src.lifecycle.models import LABEL_TEST, ContainerSpec, ImageRef, ProvisionResult
+from src.lifecycle.models import LABEL_TEST, ContainerSpec, ImageRef, LifecycleError, ProvisionResult
 from src.lifecycle.provision import DEFAULT_MOUNT_ROOT, provision
+from src.lifecycle.teardown import destroy_all_managed, remove_built_images
 
 # Already on most development machines of this project; `docker build` pulls it once if not
 BASE_IMAGE = os.environ.get("TML_TEST_BASE_IMAGE", "python:3.14-slim")
@@ -34,6 +35,9 @@ requires_docker = unittest.skipUnless(DOCKER_READY, "Docker daemon is not reacha
 
 # Touches memory in 8 MB steps until the container's memory limit kills it
 _MEMORY_HOG = r"chunks = []\nwhile True:\n    chunks.append(bytearray(b'x' * 8388608))"
+
+# Ignores SIGTERM, so a stop has to wait for its timeout and then use SIGKILL
+_IGNORE_SIGTERM = r"import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nprint('ignoring SIGTERM')\ntime.sleep(600)"
 
 # name -> Dockerfile text; what each one is for is in the comment above it
 DOCKERFILES = {
@@ -75,6 +79,11 @@ CMD ["python", "-c", "import torch"]
     "oom": f"""\
 FROM {BASE_IMAGE}
 CMD ["python", "-c", "{_MEMORY_HOG}"]
+""",
+    # long-running and does not end on SIGTERM: a stop must escalate to SIGKILL
+    "stubborn": f"""\
+FROM {BASE_IMAGE}
+CMD ["python", "-u", "-c", "{_IGNORE_SIGTERM}"]
 """,
     # no shell, no `sleep`, nothing to run: idle mode cannot start in it (needs no base image)
     "empty": """\
@@ -160,6 +169,11 @@ def remove_containers() -> None:
     """Removes every container of this test run, managed or not."""
     if not DOCKER_READY:
         return
+    try:
+        destroy_all_managed(labels=TEST_LABEL, force=True)
+    except LifecycleError:
+        pass   # the direct removal below takes what is left
+    # the unmanaged test containers (teardown refuses them by design), and any leftover
     for obj in client.get_client().containers.list(all=True, filters={"label": f"{LABEL_TEST}={RUN_ID}"}):
         obj.remove(force=True, v=True)
 
@@ -178,6 +192,10 @@ def cleanup() -> None:
     if not DOCKER_READY:
         return
     remove_containers()
+    try:
+        remove_built_images(labels=TEST_LABEL, force=True)
+    except LifecycleError:
+        pass   # the direct removal below takes what is left
     sdk = client.get_client()
     for image in sdk.images.list(filters={"label": f"{LABEL_TEST}={RUN_ID}"}):
         for tag in image.tags or [image.id]:
