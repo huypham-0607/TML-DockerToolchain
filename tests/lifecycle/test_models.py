@@ -4,7 +4,7 @@ import unittest
 from src.lifecycle.models import (
     ERROR_CODES, HEALTH,
     ContainerHandle, ContainerLogs, ContainerSpec, ContainerStatus,
-    Diagnosis, Hint, ImageRef, LifecycleError,
+    Diagnosis, Hint, ImageRef, LifecycleError, ProvisionResult,
 )
 
 
@@ -25,7 +25,8 @@ class TestSpecValidation(unittest.TestCase):
     def test_defaults(self):
         spec = ContainerSpec(image="demo:latest")
         self.assertEqual((spec.mode, spec.gpu, spec.shm_size, spec.network), ("idle", "auto", "2g", "bridge"))
-        self.assertEqual((spec.env, spec.mounts, spec.ports), ({}, [], []))
+        self.assertEqual((spec.env, spec.mounts, spec.ports, spec.labels), ({}, [], [], {}))
+        self.assertEqual((spec.memory, spec.cpus), ("", 0.0))       # default memory limit, no CPU limit
 
     def test_needs_image_or_dockerfile(self):
         self.assertInvalid(ContainerSpec(), "exactly one of image / dockerfile")
@@ -125,6 +126,49 @@ class TestSerialization(unittest.TestCase):
 
     def test_health_verdicts(self):
         self.assertEqual(set(HEALTH), {"starting", "healthy", "unhealthy", "completed", "stopped", "failed", "missing"})
+
+
+class TestProvisionResult(unittest.TestCase):
+    def result(self, mode: str, state: str, health: str, **kwargs) -> ProvisionResult:
+        handle = ContainerHandle(id="d7d9d9bb3b41", name="tml-demo", image="demo:1", image_id="51dafde81dbd", mode=mode)
+        status = ContainerStatus(container="tml-demo", state=state, health=health, handle=handle)
+        return ProvisionResult(status=status, image=ImageRef(id="51dafde81dbd", tag="demo:1"), action="created", **kwargs)
+
+    def test_healthy_is_ok_in_both_modes(self):
+        self.assertTrue(self.result("idle", "running", "healthy").ok)
+        self.assertTrue(self.result("native", "running", "healthy").ok)
+
+    def test_completed_is_ok_only_in_native_mode(self):
+        self.assertTrue(self.result("native", "exited", "completed").ok)      # the command ran to a clean end
+        self.assertFalse(self.result("idle", "exited", "completed").ok)       # an idle container must stay up
+
+    def test_other_verdicts_are_not_ok(self):
+        for health in ("starting", "unhealthy", "stopped", "failed"):
+            self.assertFalse(self.result("native", "running", health).ok, health)
+
+    def test_missing_container_is_not_ok(self):
+        status = ContainerStatus(container="gone", state="missing", health="missing")
+        result = ProvisionResult(status=status, image=ImageRef(id="5", tag="demo:1"), action="created")
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.handle)
+
+    def test_handle_shortcut(self):
+        self.assertEqual(self.result("idle", "running", "healthy").handle.name, "tml-demo")
+
+    def test_to_dict(self):
+        data = json.loads(self.result("idle", "running", "healthy").to_json())
+        self.assertEqual(set(data), {"ok", "action", "image", "status", "diagnosis"})
+        self.assertIs(data["ok"], True)
+        self.assertEqual(data["action"], "created")
+        self.assertEqual(data["image"], {"id": "51dafde81dbd", "tag": "demo:1", "built": False})
+        self.assertTrue(data["status"]["usable"])                # status keeps its derived fields
+        self.assertIsNone(data["diagnosis"])
+
+    def test_to_dict_with_a_diagnosis(self):
+        diagnosis = Diagnosis(status=ContainerStatus(container="tml-demo", state="exited", health="failed", exit_code=3))
+        data = self.result("native", "exited", "failed", diagnosis=diagnosis).to_dict()
+        self.assertIs(data["ok"], False)
+        self.assertEqual(data["diagnosis"]["status"]["exit_code"], 3)
 
 
 class TestLifecycleError(unittest.TestCase):

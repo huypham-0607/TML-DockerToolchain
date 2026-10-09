@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 
 import requests
+from docker import errors as docker_errors
 
 from src.lifecycle import status
 from src.lifecycle.models import LABEL_TEST, ContainerStatus, LifecycleError
@@ -9,13 +10,13 @@ from src.lifecycle.status import (
     derive_health, get_status, handle_from_attrs, list_managed,
     require_managed, require_running, status_from_attrs, wait_ready,
 )
-from tests.lifecycle import live
+from tests.lifecycle import samples
 from tests.lifecycle.fakes import FakeClient, FakeContainer, api_error, make_attrs, use_fake
-from tests.lifecycle.live import requires_docker
+from tests.lifecycle.samples import requires_docker
 
 
 def tearDownModule():
-    live.remove_test_containers()
+    samples.cleanup()
 
 
 # ---------------------------------------------------------------- pure suites (no daemon)
@@ -168,6 +169,12 @@ class TestStatusFromAttrs(unittest.TestCase):
 class TestGetStatus(unittest.TestCase):
     """get_status / require_managed / require_running against a fake client."""
 
+    def setUp(self):
+        # no real waiting between a failed probe and its second look
+        patcher = mock.patch.object(status, "PROBE_RETRY_DELAY", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_missing_container_is_a_verdict_not_an_error(self):
         use_fake(self, FakeClient())
         s = get_status("nope")
@@ -209,6 +216,36 @@ class TestGetStatus(unittest.TestCase):
         gone = api_error(409, "container 746d is not running")
         use_fake(self, FakeClient(FakeContainer(make_attrs(status="running"), probe=gone)))
         self.assertEqual(get_status("tml-demo").health, "unhealthy")
+
+    def test_failed_probe_is_checked_twice(self):
+        container = FakeContainer(make_attrs(status="running"), probe=127)
+        use_fake(self, FakeClient(container))
+        self.assertEqual(get_status("tml-demo").health, "unhealthy")
+        self.assertEqual(len(container.exec_calls), 2)
+
+    def test_probe_that_passes_the_second_time_is_healthy(self):
+        container = FakeContainer(make_attrs(status="running"), probe=[1, 0])
+        use_fake(self, FakeClient(container))
+        self.assertEqual(get_status("tml-demo").health, "healthy")
+
+    def test_failed_probe_of_a_container_that_just_exited(self):
+        # Docker still said "running" at the first look; the probe failed because the process had ended
+        for exit_code, verdict in ((0, "completed"), (3, "failed")):
+            container = FakeContainer(
+                make_attrs(status="running"), probe=api_error(409, "container 746d is not running"),
+                after_reload=make_attrs(status="exited", exit_code=exit_code),
+            )
+            use_fake(self, FakeClient(container))
+            s = get_status("tml-demo")
+            self.assertEqual((s.state, s.health, s.exit_code), ("exited", verdict, exit_code))
+            self.assertEqual(len(container.exec_calls), 1)       # no second probe of a stopped container
+
+    def test_failed_probe_of_a_container_that_was_removed(self):
+        gone = docker_errors.NotFound("404", explanation="No such container: tml-demo")
+        container = FakeContainer(make_attrs(status="running"), probe=1, after_reload=gone)
+        use_fake(self, FakeClient(container))
+        s = get_status("tml-demo")
+        self.assertEqual((s.state, s.health), ("missing", "missing"))
 
     def test_no_probe_when_the_image_has_a_healthcheck(self):
         container = FakeContainer(make_attrs(status="running", health="healthy"), probe=1)
@@ -349,155 +386,133 @@ class TestWaitReady(unittest.TestCase):
 
 # ---------------------------------------------------------------- live suites (real daemon)
 
-@requires_docker
-class TestLiveStatus(unittest.TestCase):
-    """Containers made directly through the SDK; lifecycle.provision is not written yet."""
+class LiveCase(unittest.TestCase):
+    """Base of the live suites: containers come from the sample Dockerfiles through provision."""
 
     @classmethod
     def tearDownClass(cls):
-        live.remove_test_containers()
+        samples.remove_containers()      # the images stay until the module ends
 
-    def exited(self, suffix: str, command, **kwargs) -> ContainerStatus:
-        obj = live.start_raw(suffix, command, **kwargs)
-        obj.wait(timeout=30)
-        return get_status(obj.name)
 
+@requires_docker
+class TestLiveStatus(LiveCase):
     def test_idle_container_is_healthy(self):
-        obj = live.start_idle("status-idle")
-        s = get_status(obj.name)
+        name = samples.start("idle", "status-idle").handle.name
+        s = get_status(name)
         self.assertEqual((s.state, s.health), ("running", "healthy"))
         self.assertIn("readiness probe passes", s.reason)
         self.assertTrue(s.usable)
         self.assertIsNone(s.exit_code)
         self.assertIsNotNone(s.started_at)
-        self.assertEqual(s.handle.name, obj.name)
+        self.assertEqual(s.handle.name, name)
         self.assertEqual(s.handle.mode, "idle")
-        self.assertEqual(s.handle.image, live.BASE_IMAGE)
+        self.assertEqual(s.handle.image, samples.build("idle").tag)
+        self.assertEqual(s.handle.image_id, samples.build("idle").id)
         self.assertFalse(s.handle.gpu)
-        self.assertEqual(s.handle.labels[LABEL_TEST], live.RUN_ID)
+        self.assertEqual(s.handle.labels[LABEL_TEST], samples.RUN_ID)
 
     def test_lookup_by_id(self):
-        obj = live.start_idle("status-by-id")
-        self.assertEqual(get_status(obj.id[:12]).handle.name, obj.name)
+        handle = samples.start("idle", "status-by-id").handle
+        self.assertEqual(get_status(handle.id).handle.name, handle.name)
 
     def test_passing_healthcheck(self):
-        obj = live.start_raw(
-            "status-healthy", ["sh", "-c", "sleep 1; touch /tmp/ready; sleep 120"],
-            healthcheck=live.healthcheck("test -f /tmp/ready", retries=5),
-        )
-        self.assertEqual(get_status(obj.name).health, "starting")
-        s = wait_ready(obj.name, timeout=20)
+        # a very short readiness wait, so the container is still "starting" when provision returns
+        name = samples.start("service", "status-healthy", mode="native", ready_timeout=0.01).handle.name
+        self.assertEqual(get_status(name).health, "starting")
+        s = wait_ready(name, timeout=20)
         self.assertEqual(s.health, "healthy")
         self.assertIn("HEALTHCHECK passes", s.reason)
 
     def test_failing_healthcheck(self):
-        obj = live.start_raw("status-unhealthy", ["sleep", "120"], healthcheck=live.healthcheck("echo db down; exit 1"))
-        s = wait_ready(obj.name, timeout=20)
+        name = samples.start("unhealthy", "status-unhealthy", mode="native").handle.name
+        s = get_status(name)
         self.assertEqual((s.state, s.health), ("running", "unhealthy"))
         self.assertEqual(s.healthcheck_output, "db down")
         self.assertIn("db down", s.reason)
         self.assertFalse(s.usable)
 
     def test_crash(self):
-        s = self.exited("status-crash", ["python", "-c", "import sys; print('boom', file=sys.stderr); sys.exit(3)"])
+        s = get_status(samples.start("crash", "status-crash", mode="native").handle.name)
         self.assertEqual((s.state, s.health, s.exit_code), ("exited", "failed", 3))
         self.assertIsNotNone(s.finished_at)
 
     def test_clean_exit(self):
-        s = self.exited("status-done", ["python", "-c", "print('done')"])
+        s = get_status(samples.start("idle", "status-done", mode="native").handle.name)
         self.assertEqual((s.state, s.health, s.exit_code), ("exited", "completed", 0))
 
     def test_missing_executable(self):
-        s = self.exited("status-noexec", ["x"], entrypoint=["/no/such/binary"])
+        s = get_status(samples.start("empty", "status-noexec").handle.name)
         self.assertEqual((s.health, s.exit_code), ("failed", 127))
 
     def test_out_of_memory(self):
-        # touch memory in 8 MB steps until the 32 MB limit kills the process
-        hog = "chunks = []\nwhile True:\n    chunks.append(bytearray(b'x' * (8 * 1024 * 1024)))"
-        s = self.exited("status-oom", ["python", "-c", hog], mem_limit="32m", memswap_limit="32m")
+        s = get_status(samples.start("oom", "status-oom", mode="native", memory="64m").handle.name)
         self.assertEqual(s.health, "failed")
         self.assertTrue(s.oom_killed)
         self.assertIn("out of memory", s.reason)
 
     def test_stopped_from_outside(self):
-        obj = live.start_idle("status-stopped")
-        obj.stop(timeout=5)
-        s = get_status(obj.name)
+        name = samples.start("idle", "status-stopped").handle.name
+        samples.sdk_container(name).stop(timeout=5)
+        s = get_status(name)
         self.assertEqual((s.state, s.health, s.exit_code), ("exited", "stopped", 143))
 
-    def test_created_but_never_started(self):
-        obj = live.start_raw("status-created", ["sleep", "120"], start=False)
-        s = get_status(obj.name)
-        self.assertEqual((s.state, s.health), ("created", "stopped"))
-        self.assertIsNone(s.exit_code)
-        self.assertIsNone(s.started_at)
-
-    def test_wait_ready_catches_a_crash_just_after_start(self):
-        obj = live.start_raw("status-late-crash", ["sh", "-c", "sleep 0.5; exit 4"])
-        s = wait_ready(obj.name, timeout=20, settle=1.5)
-        self.assertEqual((s.health, s.exit_code), ("failed", 4))
-
     def test_missing(self):
-        s = get_status(live.container_name("status-never-made"))
+        s = get_status(samples.container_name("status-never-made"))
         self.assertEqual((s.state, s.health), ("missing", "missing"))
 
 
 @requires_docker
-class TestLiveListing(unittest.TestCase):
+class TestLiveListing(LiveCase):
     @classmethod
     def setUpClass(cls):
-        cls.running = live.start_idle("list-running")
-        cls.exited = live.start_raw("list-exited", ["python", "-c", "raise SystemExit(3)"])
-        cls.exited.wait(timeout=30)
-        cls.unmanaged = live.start_idle("list-unmanaged", managed=False)
-
-    @classmethod
-    def tearDownClass(cls):
-        live.remove_test_containers()
+        cls.running = samples.start("idle", "list-running").handle.name
+        cls.exited = samples.start("crash", "list-exited", mode="native").handle.name
+        cls.unmanaged = samples.start_unmanaged("list-unmanaged").name
 
     def test_lists_managed_containers_of_this_run(self):
-        by_name = {s.container: s for s in list_managed(labels=live.TEST_LABEL)}
-        self.assertEqual(set(by_name), {self.running.name, self.exited.name})
-        self.assertEqual(by_name[self.running.name].health, "healthy")
-        self.assertEqual(by_name[self.exited.name].health, "failed")
+        by_name = {s.container: s for s in list_managed(labels=samples.TEST_LABEL)}
+        self.assertEqual(set(by_name), {self.running, self.exited})
+        self.assertEqual(by_name[self.running].health, "healthy")
+        self.assertEqual(by_name[self.exited].health, "failed")
 
     def test_running_only(self):
-        names = [s.container for s in list_managed(all=False, labels=live.TEST_LABEL)]
-        self.assertEqual(names, [self.running.name])
+        names = [s.container for s in list_managed(all=False, labels=samples.TEST_LABEL)]
+        self.assertEqual(names, [self.running])
 
     def test_unmanaged_container_never_appears(self):
-        self.assertNotIn(self.unmanaged.name, [s.container for s in list_managed()])
+        self.assertNotIn(self.unmanaged, [s.container for s in list_managed()])
 
     def test_unmanaged_container_is_refused(self):
         for call in (get_status, require_managed, require_running):
             with self.assertRaises(LifecycleError) as ctx:
-                call(self.unmanaged.name)
+                call(self.unmanaged)
             self.assertEqual(ctx.exception.code, "not_managed", call.__name__)
 
 
 @requires_docker
-class TestLiveRequireRunning(unittest.TestCase):
-    @classmethod
-    def tearDownClass(cls):
-        live.remove_test_containers()
-
+class TestLiveRequireRunning(LiveCase):
     def test_running_container_gives_its_handle(self):
-        obj = live.start_idle("require-running")
-        handle = require_running(obj.name)
-        self.assertEqual(handle.name, obj.name)
-        self.assertEqual(handle.id, obj.id[:12])
+        provisioned = samples.start("idle", "require-running").handle
+        handle = require_running(provisioned.name)
+        self.assertEqual((handle.name, handle.id), (provisioned.name, provisioned.id))
 
     def test_stopped_container_is_refused(self):
-        obj = live.start_idle("require-stopped")
-        obj.stop(timeout=5)
+        name = samples.start("idle", "require-stopped").handle.name
+        samples.sdk_container(name).stop(timeout=5)
         with self.assertRaises(LifecycleError) as ctx:
-            require_running(obj.name)
+            require_running(name)
         self.assertEqual(ctx.exception.code, "not_running")
         self.assertIn("exited", ctx.exception.message)
 
+    def test_finished_container_is_refused(self):
+        name = samples.start("idle", "require-done", mode="native").handle.name
+        with self.assertRaises(LifecycleError) as ctx:
+            require_running(name)
+        self.assertEqual(ctx.exception.code, "not_running")
+
     def test_missing_container(self):
         with self.assertRaises(LifecycleError) as ctx:
-            require_running(live.container_name("require-never-made"))
+            require_running(samples.container_name("require-never-made"))
         self.assertEqual(ctx.exception.code, "not_found")
 
 

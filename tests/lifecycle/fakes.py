@@ -1,7 +1,8 @@
 """
     Fakes for the lifecycle suites that need no Docker daemon.
 
-    make_attrs() builds `docker inspect` output; FakeClient stands in for the SDK client.
+    make_attrs() builds `docker inspect` output; FakeClient stands in for the SDK client
+    (containers.get / containers.list, images.get, ping, info).
     use_fake(test, fake) makes src.lifecycle.client.get_client() return the fake for one test.
 """
 
@@ -79,11 +80,20 @@ def make_attrs(
 
 
 class FakeContainer:
-    """SDK Container stand-in. `probe` is the exit code of exec_run, or an exception to raise."""
+    """SDK Container stand-in.
 
-    def __init__(self, attrs: dict, probe: int | Exception = 0):
+    Args:
+        attrs: `docker inspect` output (see make_attrs).
+        probe: exit code of exec_run, or an exception to raise; a list gives one entry
+            to each call in turn (the last one repeats).
+        after_reload: attrs that reload() switches to, as if the state changed meanwhile;
+            an exception makes reload() raise it.
+    """
+
+    def __init__(self, attrs: dict, probe=0, after_reload: dict | Exception | None = None):
         self.attrs = attrs
         self.probe = probe
+        self.after_reload = after_reload
         self.exec_calls: list = []
 
     @property
@@ -98,14 +108,24 @@ class FakeContainer:
     def labels(self) -> dict:
         return self.attrs["Config"]["Labels"]
 
+    @property
+    def status(self) -> str:
+        return self.attrs["State"]["Status"]
+
     def reload(self):
-        pass
+        if isinstance(self.after_reload, Exception):
+            raise self.after_reload
+        if self.after_reload is not None:
+            self.attrs = self.after_reload
 
     def exec_run(self, cmd, **kwargs):
         self.exec_calls.append(cmd)
-        if isinstance(self.probe, Exception):
-            raise self.probe
-        return ExecResult(self.probe, b"")
+        outcome = self.probe
+        if isinstance(outcome, list):
+            outcome = outcome[min(len(self.exec_calls), len(outcome)) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return ExecResult(outcome, b"")
 
 
 class FakeContainers:
@@ -143,12 +163,35 @@ def all_labels_match(labels: dict, wanted: list[str]) -> bool:
     return True
 
 
+class FakeImage:
+    def __init__(self, tag: str, image_id: str = "sha256:" + "51dafde81dbd" + "0" * 52, labels: dict | None = None):
+        self.id = image_id
+        self.tags = [tag]
+        self.labels = labels or {}
+
+
+class FakeImages:
+    """Only the images given to it exist; like lifecycle, it never pulls."""
+
+    def __init__(self, images):
+        self._images = list(images)
+        self.get_calls: list[str] = []
+
+    def get(self, name: str):
+        self.get_calls.append(name)
+        for image in self._images:
+            if name in image.tags or image.id.startswith(name) or image.id.removeprefix("sha256:").startswith(name):
+                return image
+        raise docker_errors.ImageNotFound("404 Client Error: Not Found", explanation=f"No such image: {name}")
+
+
 class FakeClient:
     """SDK DockerClient stand-in. `error` makes every container call raise it."""
 
-    def __init__(self, *containers: FakeContainer, info: dict | None = None, error: Exception | None = None):
+    def __init__(self, *containers: FakeContainer, images=(), info: dict | None = None, error: Exception | None = None):
         self.containers = FakeContainers(containers, error)
-        self._info = info if info is not None else {"Runtimes": {"runc": {"path": "runc"}}}
+        self.images = FakeImages(images)
+        self._info = info if info is not None else {"Runtimes": {"runc": {"path": "runc"}}, "MemTotal": 16 * 1024**3}
 
     def ping(self) -> bool:
         return True

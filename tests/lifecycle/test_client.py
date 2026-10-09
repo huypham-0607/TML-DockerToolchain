@@ -10,7 +10,7 @@ from docker import errors as docker_errors
 from src.lifecycle import client
 from src.lifecycle.models import ERROR_CODES, LifecycleError
 from tests.lifecycle.fakes import FakeClient, api_error, use_fake
-from tests.lifecycle.live import requires_docker
+from tests.lifecycle.samples import requires_docker
 
 
 class TestTranslate(unittest.TestCase):
@@ -47,6 +47,17 @@ class TestTranslate(unittest.TestCase):
         err = client.translate(exc)
         self.assertEqual(err.code, "gpu_unavailable")
         self.assertIn("gpu='none'", err.hint)
+
+    def test_gpu_unavailable_cdi_wording(self):
+        # Engine 28+ finds GPUs through CDI and words the failure differently
+        exc = api_error(500, "failed to discover GPU vendor from CDI: no known GPU vendor found")
+        self.assertEqual(self.code(exc), "gpu_unavailable")
+
+    def test_mount_denied_by_docker_desktop(self):
+        exc = api_error(500, "mounts denied: \nThe path /tmp/data is not shared from the host and is not known to Docker.")
+        err = client.translate(exc)
+        self.assertEqual(err.code, "invalid_argument")
+        self.assertIn("File Sharing", err.hint)
 
     def test_port_conflict(self):
         exc = api_error(500, "driver failed programming external connectivity: Bind for 0.0.0.0:8888 failed: port is already allocated")
