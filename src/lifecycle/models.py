@@ -248,9 +248,10 @@ class Diagnosis(_Serializable):
     status: ContainerStatus
     logs: ContainerLogs | None = None
     hints: list[Hint] = field(default_factory=list)
-    processes: list[dict] = field(default_factory=list)
-    resources: dict = field(default_factory=dict)
-    events: list[dict] = field(default_factory=list)
+    processes: list[dict] = field(default_factory=list)   # running containers only
+    resources: dict = field(default_factory=dict)         # running containers only: CPU, memory, process count
+    events: list[dict] = field(default_factory=list)      # start, die, kill, oom, health changes
+    notes: list[str] = field(default_factory=list)        # parts that could not be read
 
     def to_dict(self) -> dict:
         d = asdict(self)
