@@ -34,6 +34,9 @@ MAX_HEALTHCHECK_CHARS = 500
 # Fixed, no-op command of the readiness probe. Not an execution interface.
 PROBE_COMMAND = ["true"]
 
+# Seconds before a failed probe is checked again
+PROBE_RETRY_DELAY = 0.3
+
 
 # ---------------------------------------------------------------- pure helpers
 
@@ -191,11 +194,29 @@ def _probe(obj) -> bool:
         return False
 
 
+def _running(obj) -> bool:
+    return (obj.attrs.get("State") or {}).get("Status") == "running"
+
+
 def _status_of(obj, probe: bool, asked: str = "") -> ContainerStatus:
     state = obj.attrs.get("State") or {}
     # the probe only decides when the container runs and the image has no HEALTHCHECK
-    needs_probe = probe and state.get("Status") == "running" and not state.get("Health")
-    return status_from_attrs(obj.attrs, _probe(obj) if needs_probe else None, asked)
+    probe_ok = None
+    if probe and _running(obj) and not state.get("Health"):
+        probe_ok = _probe(obj)
+        if not probe_ok:
+            # a failed probe usually means the main process has just exited: give the daemon
+            # a moment to record that, then look again before calling the container unhealthy
+            time.sleep(PROBE_RETRY_DELAY)
+            try:
+                with client.translated(f"inspect container {obj.name!r}"):
+                    obj.reload()
+            except LifecycleError as e:
+                if e.code == "not_found":
+                    return _missing(asked or obj.name)
+                raise
+            probe_ok = _probe(obj) if _running(obj) else None
+    return status_from_attrs(obj.attrs, probe_ok, asked)
 
 
 def get_status(container: str, probe: bool = True) -> ContainerStatus:
@@ -261,7 +282,7 @@ def wait_ready(container: str, timeout: float = 30.0, interval: float = 0.25, se
         time.sleep(interval)
 
 
-def require_running(container: str) -> ContainerHandle:
+def require_running(container: str) -> ContainerHandle | None:
     """Returns the handle of a running managed container. For the execution toolchain.
 
     Raises LifecycleError: not_found, not_managed, or not_running.

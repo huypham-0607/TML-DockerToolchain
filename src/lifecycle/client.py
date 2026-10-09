@@ -87,8 +87,15 @@ def translate(exc: BaseException, what: str = "") -> LifecycleError:
     if isinstance(exc, docker_errors.NotFound):
         return err("not_found", "list the managed containers with container_status()")
     if isinstance(exc, docker_errors.APIError):
-        if "could not select device driver" in low or "nvidia-container-cli" in low:
+        # Engine < 28 / NVIDIA runtime wording, then the CDI wording of newer engines
+        if "could not select device driver" in low or "nvidia-container-cli" in low or "gpu vendor" in low:
             return err("gpu_unavailable", "this daemon cannot give the container a GPU; provision again with gpu='none'")
+        if "mounts denied" in low:
+            return err(
+                "invalid_argument",
+                "Docker Desktop shares only some host directories: use one under your home directory, "
+                "or add this one in Docker Desktop > Settings > Resources > File Sharing",
+            )
         if "port is already allocated" in low or "address already in use" in low:
             return err("port_conflict", "choose a different host port")
         if exc.status_code == 409:

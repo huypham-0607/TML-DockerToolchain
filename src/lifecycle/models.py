@@ -6,6 +6,7 @@
       - ImageRef          an image that is ready to run
       - ContainerHandle   the hand-off object for the execution toolchain
       - ContainerStatus   Docker state plus the derived health verdict
+      - ProvisionResult   what provision returns: status, image, and what it did
       - ContainerLogs, Hint, Diagnosis   results of the diagnostics section
       - LifecycleError    raised by the Python API; agent tools turn it into {"ok": false, ...}
 
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field, asdict
 LABEL_MANAGED = "tml.managed"     # "true" on every container this toolchain created
 LABEL_MODE = "tml.mode"           # idle | native
 LABEL_IMAGE = "tml.image"         # image reference the container was started from
+LABEL_SPEC = "tml.spec"           # fingerprint of the image and settings, to decide if a container can be reused
 LABEL_BUILT_BY = "tml.built-by"   # "lifecycle" on images built by lifecycle.image
 LABEL_TEST = "tml.test"           # test run id, so test cleanup never touches a real session
 LABEL_PREFIX = "tml."
@@ -95,11 +97,12 @@ class ContainerSpec(_Serializable):
     ports: list[str] = field(default_factory=list)    # "host:container" or "container"
     workdir: str = ""
     gpu: str = "auto"               # auto: use the GPU if the daemon has an NVIDIA runtime
-    memory: str = ""                # e.g. "8g"; empty = default limit
-    cpus: float = 0.0               # 0 = default limit
+    memory: str = ""                # e.g. "8g"; empty = default limit (a share of the host memory)
+    cpus: float = 0.0               # 0 = no limit
     shm_size: str = "2g"            # PyTorch DataLoader workers need more than Docker's 64 MB
     network: str = "bridge"         # bridge | none
     user: str = ""
+    labels: dict[str, str] = field(default_factory=dict)  # extra labels for the container (and a built image)
 
     def validate(self) -> "ContainerSpec":
         """Checks the shape of the spec. Raises LifecycleError("invalid_argument")."""
@@ -176,6 +179,33 @@ class ContainerStatus(_Serializable):
         d["running"] = self.running
         d["usable"] = self.usable
         return d
+
+
+@dataclass
+class ProvisionResult(_Serializable):
+    status: ContainerStatus
+    image: ImageRef
+    action: str                # created | replaced | reused | restarted
+    diagnosis: Diagnosis | None = None     # filled when the container did not become usable
+
+    @property
+    def handle(self) -> ContainerHandle | None:
+        return self.status.handle
+
+    @property
+    def ok(self) -> bool:
+        """True if the container is ready, or if a native-mode command ran to a clean end."""
+        mode = self.status.handle.mode if self.status.handle else ""
+        return self.status.usable or (mode == "native" and self.status.health == "completed")
+
+    def to_dict(self) -> dict:
+        return {
+            "ok": self.ok,
+            "action": self.action,
+            "image": self.image.to_dict(),
+            "status": self.status.to_dict(),
+            "diagnosis": self.diagnosis.to_dict() if self.diagnosis else None,
+        }
 
 
 @dataclass
