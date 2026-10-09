@@ -7,6 +7,7 @@
       - ContainerHandle   the hand-off object for the execution toolchain
       - ContainerStatus   Docker state plus the derived health verdict
       - ProvisionResult   what provision returns: status, image, and what it did
+      - TeardownResult    what stop / remove / destroy return: what was done, and the state after
       - ContainerLogs, Hint, Diagnosis   results of the diagnostics section
       - LifecycleError    raised by the Python API; agent tools turn it into {"ok": false, ...}
 
@@ -45,6 +46,7 @@ ERROR_CODES = (
     "not_found",           # no such container
     "not_managed",         # container exists but was not created by this toolchain
     "not_running",         # operation needs a running container
+    "still_running",       # operation needs a stopped container
     "name_conflict",       # name is taken by a container of a different image
     "invalid_argument",
     "gpu_unavailable",
@@ -206,6 +208,21 @@ class ProvisionResult(_Serializable):
             "status": self.status.to_dict(),
             "diagnosis": self.diagnosis.to_dict() if self.diagnosis else None,
         }
+
+
+@dataclass
+class TeardownResult(_Serializable):
+    container: str
+    status: ContainerStatus       # state after the call; "missing" after a removal
+    stopped: bool = False         # this call stopped a container that was running
+    killed: bool = False          # the stop needed SIGKILL: the process did not end on SIGTERM in time
+    removed: bool = False         # this call removed the container
+    exit_code: int | None = None  # last exit code; kept here because a removed container has no status
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["status"] = self.status.to_dict()
+        return d
 
 
 @dataclass
