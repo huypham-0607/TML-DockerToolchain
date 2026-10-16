@@ -36,6 +36,7 @@ from docker.types import DeviceRequest
 from docker.utils import parse_bytes
 
 from . import client
+from .diagnostics import diagnose
 from .image import ensure_image, resolve_image
 from .models import (
     LABEL_IMAGE, LABEL_MANAGED, LABEL_MODE, LABEL_SPEC,
@@ -242,12 +243,23 @@ def _has_healthcheck(obj) -> bool:
     return bool(test) and test != ["NONE"]
 
 
+def _finish(name: str, image, action: str, timeout: float) -> ProvisionResult:
+    """Waits for readiness and, if the container is not usable, adds the diagnosis."""
+    result = ProvisionResult(status=wait_ready(name, timeout=timeout), image=image, action=action)
+    if not result.ok:
+        try:
+            result.diagnosis = diagnose(name)
+        except LifecycleError:
+            pass   # the status already says that it failed; a diagnosis that cannot be read must not hide it
+    return result
+
+
 def provision(spec: ContainerSpec, replace: bool = False, ready_timeout: float | None = None) -> ProvisionResult:
     """Starts a container and waits until it is ready.
 
     A container that starts and then fails is NOT an exception: the result carries its
-    status (health "failed", exit code) and the container is kept for diagnosis.
-    Check ProvisionResult.ok.
+    status (health "failed", exit code) and a diagnosis (log tail, hints), and the
+    container is kept. Check ProvisionResult.ok.
 
     If a managed container with the same name exists:
       - same image and settings: it is reused (and started again if it had stopped)
@@ -298,7 +310,7 @@ def provision(spec: ContainerSpec, replace: bool = False, ready_timeout: float |
                 with client.translated(f"start container {name!r}"):
                     existing.start()
             timeout = ready_timeout or (HEALTHCHECK_READY_TIMEOUT if _has_healthcheck(existing) else READY_TIMEOUT)
-            return ProvisionResult(status=wait_ready(name, timeout=timeout), image=image, action=action)
+            return _finish(name, image, action, timeout)
         if not replace:
             raise LifecycleError(
                 "name_conflict",
@@ -319,4 +331,4 @@ def provision(spec: ContainerSpec, replace: bool = False, ready_timeout: float |
         raise
 
     timeout = ready_timeout or (HEALTHCHECK_READY_TIMEOUT if _has_healthcheck(obj) else READY_TIMEOUT)
-    return ProvisionResult(status=wait_ready(name, timeout=timeout), image=image, action=action)
+    return _finish(name, image, action, timeout)

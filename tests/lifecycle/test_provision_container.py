@@ -1,3 +1,5 @@
+import importlib
+import json
 import os
 import tempfile
 import unittest
@@ -7,7 +9,7 @@ from unittest import mock
 from src.lifecycle import client
 from src.lifecycle.models import (
     LABEL_IMAGE, LABEL_MANAGED, LABEL_MODE, LABEL_SPEC, LABEL_TEST,
-    ContainerSpec, LifecycleError,
+    ContainerHandle, ContainerSpec, ContainerStatus, Diagnosis, ImageRef, LifecycleError, ProvisionResult,
 )
 from src.lifecycle.provision import (
     DEFAULT_MOUNT_ROOT, MOUNT_ROOTS_ENV, PIDS_LIMIT,
@@ -20,6 +22,9 @@ from tests.lifecycle.fakes import FakeClient, FakeContainer, FakeImage, make_att
 from tests.lifecycle.samples import requires_docker
 
 GB = 1024 ** 3
+
+# the module itself: the name src.lifecycle.provision is the function that the package exports
+provision_module = importlib.import_module("src.lifecycle.provision")
 
 
 def tearDownModule():
@@ -389,7 +394,7 @@ class TestNativeMode(LiveCase):
         r = samples.start("crash", "native-crash", mode="native")
         self.assertFalse(r.ok)
         self.assertEqual((r.status.state, r.status.health, r.status.exit_code), ("exited", "failed", 3))
-        self.assertIsNone(r.diagnosis)                      # filled by the diagnostics section later
+        self.assertIsNotNone(r.diagnosis)                   # see TestFailedStart
 
     def test_missing_python_module(self):
         r = samples.start("missing-module", "native-module", mode="native")
@@ -601,6 +606,118 @@ class TestDockerfileInput(LiveCase):
         with self.assertRaises(LifecycleError) as ctx:
             provision(spec)
         self.assertEqual(ctx.exception.code, "invalid_argument")
+
+
+class TestFinish(unittest.TestCase):
+    """The last step of provision: wait for readiness, and diagnose a container that is not usable."""
+
+    IMAGE = ImageRef(id="51dafde81dbd", tag="demo:1")
+
+    def finish(self, health: str, mode: str = "idle", diagnosis=None) -> tuple[ProvisionResult, mock.Mock]:
+        handle = ContainerHandle(id="d7d9d9bb3b41", name="tml-demo", image="demo:1", image_id="51dafde81dbd", mode=mode)
+        status = ContainerStatus(container="tml-demo", state="exited", health=health, handle=handle)
+        wait = mock.patch.object(provision_module, "wait_ready", return_value=status)
+        outcome = {"side_effect": diagnosis} if isinstance(diagnosis, Exception) else {"return_value": diagnosis}
+        diag = mock.patch.object(provision_module, "diagnose", **outcome)
+        self.wait, diagnose_mock = wait.start(), diag.start()
+        self.addCleanup(wait.stop)
+        self.addCleanup(diag.stop)
+        return provision_module._finish("tml-demo", self.IMAGE, "created", 12.5), diagnose_mock
+
+    def test_usable_container_is_not_diagnosed(self):
+        result, diagnose_mock = self.finish("healthy")
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.diagnosis)
+        diagnose_mock.assert_not_called()                          # no extra Docker calls on the normal path
+        self.wait.assert_called_once_with("tml-demo", timeout=12.5)
+
+    def test_native_command_that_ended_cleanly_is_not_diagnosed(self):
+        result, diagnose_mock = self.finish("completed", mode="native")
+        self.assertTrue(result.ok)
+        diagnose_mock.assert_not_called()
+
+    def test_failed_container_gets_its_diagnosis(self):
+        diagnosis = Diagnosis(status=ContainerStatus(container="tml-demo", state="exited", health="failed"))
+        for health in ("failed", "unhealthy", "starting", "stopped"):
+            result, diagnose_mock = self.finish(health, diagnosis=diagnosis)
+            self.assertFalse(result.ok, health)
+            self.assertIs(result.diagnosis, diagnosis)
+            diagnose_mock.assert_called_once_with("tml-demo")
+
+    def test_idle_container_that_ended_is_diagnosed(self):
+        result, diagnose_mock = self.finish("completed", mode="idle", diagnosis=Diagnosis(status=ContainerStatus("c", "exited", "completed")))
+        self.assertFalse(result.ok)
+        diagnose_mock.assert_called_once()
+
+    def test_diagnosis_that_cannot_be_read_does_not_hide_the_status(self):
+        result, _ = self.finish("failed", diagnosis=LifecycleError("docker_unavailable", "daemon went away"))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status.health, "failed")
+        self.assertIsNone(result.diagnosis)
+
+    def test_result_keeps_image_and_action(self):
+        result, _ = self.finish("healthy")
+        self.assertEqual((result.image, result.action), (self.IMAGE, "created"))
+
+
+@requires_docker
+class TestFailedStart(LiveCase):
+    """A container that does not become usable comes back with its diagnosis: no second call is needed."""
+
+    def test_crash(self):
+        r = samples.start("crash", "fail-crash", mode="native")
+        self.assertFalse(r.ok)
+        d = r.diagnosis
+        self.assertEqual((d.status.health, d.status.exit_code), ("failed", 3))
+        self.assertEqual(d.logs.stderr, "boom")
+        self.assertEqual(d.hints, [])                               # no known pattern in "boom"
+
+    def test_missing_python_module(self):
+        r = samples.start("missing-module", "fail-module", mode="native")
+        (hint,) = r.diagnosis.hints
+        self.assertEqual((hint.code, hint.owner), ("missing_python_module", "dockerization"))
+        self.assertIn("No module named 'torch'", hint.evidence)
+
+    def test_out_of_memory(self):
+        r = samples.start("oom", "fail-oom", mode="native", memory="64m")
+        self.assertEqual([(h.code, h.owner) for h in r.diagnosis.hints], [("out_of_memory", "lifecycle")])
+
+    def test_image_that_cannot_idle(self):
+        r = samples.start("empty", "fail-empty")
+        (hint,) = r.diagnosis.hints
+        self.assertEqual((hint.code, hint.owner), ("missing_executable", "dockerization"))
+        self.assertIn("mode='native'", hint.suggestion)
+
+    def test_failing_healthcheck(self):
+        r = samples.start("unhealthy", "fail-unhealthy", mode="native")
+        self.assertFalse(r.ok)
+        self.assertEqual([h.code for h in r.diagnosis.hints], ["healthcheck_failing"])
+        self.assertTrue(r.diagnosis.processes)                      # still running, so its processes are listed
+
+    def test_still_starting_at_the_timeout(self):
+        r = samples.start("service", "fail-slow", mode="native", ready_timeout=0.01)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.status.health, "starting")
+        self.assertIsNotNone(r.diagnosis)
+
+    def test_healthy_container_has_no_diagnosis(self):
+        self.assertIsNone(samples.start("idle", "fail-none").diagnosis)
+        self.assertIsNone(samples.start("idle", "fail-none-native", mode="native").diagnosis)    # ended with code 0
+
+    def test_restarted_container_that_fails_again(self):
+        first = samples.start("crash", "fail-again", mode="native")
+        again = samples.start("crash", "fail-again", mode="native")
+        self.assertEqual((first.action, again.action), ("created", "restarted"))
+        self.assertFalse(again.ok)
+        self.assertEqual(again.diagnosis.logs.stderr, "boom\nboom")     # the log of both runs
+
+    def test_diagnosis_is_in_the_serialized_result(self):
+        data = samples.start("missing-module", "fail-json", mode="native").to_dict()
+        self.assertIs(data["ok"], False)
+        self.assertEqual(data["diagnosis"]["hints"][0]["code"], "missing_python_module")
+        self.assertEqual(data["diagnosis"]["hints"][0]["owner"], "dockerization")
+        self.assertIn("ModuleNotFoundError", data["diagnosis"]["logs"]["stderr"])
+        json.dumps(data)
 
 
 @requires_docker

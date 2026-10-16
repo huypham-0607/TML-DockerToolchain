@@ -53,6 +53,7 @@ ERROR_CODES = (
     "port_conflict",
     "timeout",
     "docker_error",        # anything else the daemon rejected
+    "internal_error",      # a fault in this toolchain (agent tools only report it, they never raise)
 )
 
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]+$")

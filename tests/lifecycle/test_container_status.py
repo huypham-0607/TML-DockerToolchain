@@ -416,10 +416,10 @@ class TestLiveStatus(LiveCase):
         self.assertEqual(get_status(handle.id).handle.name, handle.name)
 
     def test_passing_healthcheck(self):
-        # a very short readiness wait, so the container is still "starting" when provision returns
-        name = samples.start("service", "status-healthy", mode="native", ready_timeout=0.01).handle.name
-        self.assertEqual(get_status(name).health, "starting")
-        s = wait_ready(name, timeout=20)
+        # a very short readiness wait: provision gives up while the HEALTHCHECK has not passed yet
+        result = samples.start("service", "status-healthy", mode="native", ready_timeout=0.01)
+        self.assertEqual(result.status.health, "starting")
+        s = wait_ready(result.handle.name, timeout=20)
         self.assertEqual(s.health, "healthy")
         self.assertIn("HEALTHCHECK passes", s.reason)
 

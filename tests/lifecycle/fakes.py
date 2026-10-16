@@ -2,8 +2,8 @@
     Fakes for the lifecycle suites that need no Docker daemon.
 
     make_attrs() builds `docker inspect` output; FakeClient stands in for the SDK client
-    (containers.get / list, container stop / remove / reload / exec_run, images.get / list / remove,
-    ping, info).
+    (containers.get / list, container stop / remove / reload / exec_run / logs / top / stats,
+    images.get / list / remove, events, ping, info).
     use_fake(test, fake) makes src.lifecycle.client.get_client() return the fake for one test.
 """
 
@@ -108,6 +108,13 @@ class FakeContainer:
         self.exec_calls: list = []
         self.calls: list[tuple] = []        # ("stop", timeout) / ("remove", force, v), in order
         self.owner: "FakeContainers | None" = None
+        # diagnostics: set these after construction; an exception in place of a value is raised
+        self.stdout_log: bytes | Exception = b""
+        self.stderr_log: bytes | Exception = b""
+        self.top_result: dict | Exception = {"Titles": ["UID", "PID", "CMD"], "Processes": [["root", "1", "sleep infinity"]]}
+        self.stats_result: dict | Exception = {}
+        self.log_calls: list[dict] = []     # keyword arguments of each logs() call
+        self.read_calls: list[str] = []     # "top" / "stats", in order
 
     @property
     def id(self) -> str:
@@ -139,6 +146,32 @@ class FakeContainer:
         if isinstance(outcome, Exception):
             raise outcome
         return ExecResult(outcome, b"")
+
+    def logs(self, stdout: bool = True, stderr: bool = True, tail="all", **kwargs) -> bytes:
+        """Like the SDK: one stream per call here. `tail` keeps the last lines of that stream."""
+        self.log_calls.append({"stdout": stdout, "stderr": stderr, "tail": tail, **kwargs})
+        data = b""
+        for wanted, stream in ((stdout, self.stdout_log), (stderr, self.stderr_log)):
+            if not wanted:
+                continue
+            if isinstance(stream, Exception):
+                raise stream
+            data += stream
+        if isinstance(tail, int):
+            data = b"".join(data.splitlines(keepends=True)[-tail:])
+        return data
+
+    def top(self) -> dict:
+        self.read_calls.append("top")
+        if isinstance(self.top_result, Exception):
+            raise self.top_result
+        return self.top_result
+
+    def stats(self, stream: bool = True) -> dict:
+        self.read_calls.append("stats")
+        if isinstance(self.stats_result, Exception):
+            raise self.stats_result
+        return self.stats_result
 
     def stop(self, timeout: int = 10):
         self.calls.append(("stop", timeout))
@@ -258,6 +291,8 @@ class FakeClient:
     ):
         self.containers = FakeContainers(containers, error)
         self.images = FakeImages(images, image_remove_errors)
+        self.events_result: list | Exception = []   # what events() yields; an exception is raised
+        self.event_calls: list[dict] = []
         self._info = info if info is not None else {"Runtimes": {"runc": {"path": "runc"}}, "MemTotal": 16 * 1024**3}
 
     def ping(self) -> bool:
@@ -265,6 +300,12 @@ class FakeClient:
 
     def info(self) -> dict:
         return self._info
+
+    def events(self, **kwargs):
+        self.event_calls.append(kwargs)
+        if isinstance(self.events_result, Exception):
+            raise self.events_result
+        return iter(self.events_result)
 
 
 def use_fake(test, fake: FakeClient) -> FakeClient:

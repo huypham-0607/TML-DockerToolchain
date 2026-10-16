@@ -9,8 +9,7 @@
       L2   status     state and health of managed containers
       L3   diagnostics  logs, and a diagnosis with hints: what failed, who can act on it
       L4   teardown   stop and remove containers; remove images that lifecycle built
-
-    Section L5 (agent tools) is not written yet.
+      L5   tools      the six agent tools (TOOLS), JSON in and out; also the CLI: python -m src.lifecycle
 """
 
 from .client import docker_available, has_nvidia_runtime
