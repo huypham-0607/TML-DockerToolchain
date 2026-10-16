@@ -7,7 +7,7 @@ import requests
 from docker import errors as docker_errors
 
 from src.lifecycle import client
-from src.lifecycle.image import find_image
+from src.lifecycle.image import ensure_image, find_image
 from src.lifecycle.models import LABEL_BUILT_BY, LABEL_TEST, ContainerSpec, LifecycleError
 from src.lifecycle.provision import provision
 from src.lifecycle.status import get_status, list_managed
@@ -334,6 +334,41 @@ class TestRemoveBuiltImagesLogic(unittest.TestCase):
         use_fake(self, FakeClient(images=[self.image("python:3.14-slim", 3)]))
         self.assertEqual(remove_built_images(), [])
 
+    def chain(self, final_tag: str, n: int, base: FakeImage, depth: int = 2, **labels) -> list[FakeImage]:
+        """Untagged intermediate images on top of `base`, then the final tagged image."""
+        images, parent = [], base.id
+        for step in range(depth):
+            step_image = FakeImage("", image_id="sha256:" + f"{n:02x}{step:02x}" * 16, parent=parent)
+            images.append(step_image)
+            parent = step_image.id
+        images.append(FakeImage(final_tag, image_id="sha256:" + f"{n:02x}ff" * 16, labels=labels, parent=parent))
+        return images
+
+    def test_intermediate_images_of_a_build_go_too(self):
+        base = self.image("python:3.14-slim", 3)
+        foreign = FakeImage("", image_id="sha256:" + "ee" * 32, labels={"maintainer": "someone"})    # untagged, not ours
+        fake = use_fake(self, FakeClient(images=[base, foreign, *self.chain("tml-local/a:1", 1, base, **self.BUILT)]))
+        self.assertEqual(remove_built_images(), ["tml-local/a:1"])
+        self.assertEqual([i.id for i in fake.images._images], [base.id, foreign.id])     # the base image stays
+
+    def test_shared_intermediate_images_stay_while_needed(self):
+        base = self.image("python:3.14-slim", 3)
+        first = self.chain("tml-local/a:1", 1, base, **self.BUILT)
+        shared_parent = first[-1].attrs["Parent"]
+        second = FakeImage("tml-local/b:2", image_id="sha256:" + "bb" * 32, labels=dict(self.BUILT), parent=shared_parent)
+        fake = use_fake(self, FakeClient(images=[base, *first, second]))
+        # both in one call: the shared steps go once the second image is gone
+        self.assertEqual(sorted(remove_built_images()), ["tml-local/a:1", "tml-local/b:2"])
+        self.assertEqual([i.id for i in fake.images._images], [base.id])
+
+    def test_intermediate_images_of_an_image_that_stays(self):
+        base = self.image("python:3.14-slim", 3)
+        mine = self.chain("tml-local/a:1", 1, base, **self.BUILT, **{LABEL_TEST: "run1"})
+        other = FakeImage("tml-local/b:2", image_id="sha256:" + "bb" * 32, labels=dict(self.BUILT), parent=mine[-1].attrs["Parent"])
+        fake = use_fake(self, FakeClient(images=[base, *mine, other]))
+        self.assertEqual(remove_built_images(labels={LABEL_TEST: "run1"}), ["tml-local/a:1"])
+        self.assertEqual({i.id for i in fake.images._images}, {base.id, mine[0].id, mine[1].id, other.id})   # still needed by b
+
 
 # ---------------------------------------------------------------- live suites (real daemon)
 
@@ -557,6 +592,22 @@ class TestRemoveBuiltImages(LiveCase):
         samples.build("idle")
         remove_built_images(labels=samples.TEST_LABEL, force=True)
         self.assertIsNotNone(find_image(samples.BASE_IMAGE))                       # the base image is not ours
+
+    def test_no_untagged_leftovers(self):
+        # the same Dockerfile in two directories, then a changed one: classic builds share and leave intermediate images
+        sdk = client.get_client()
+        before = {i.id for i in sdk.images.list(filters={"dangling": True})}
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, text in enumerate((samples.DOCKERFILES["idle"], samples.DOCKERFILES["idle"] + "ENV CHANGED=1\n")):
+                path = Path(tmp) / str(i) / "Dockerfile"
+                path.parent.mkdir()
+                path.write_text(text)
+                ensure_image(path, labels=samples.TEST_LABEL)
+        samples.build("idle")
+        remove_built_images(labels=samples.TEST_LABEL)
+        after = {i.id for i in sdk.images.list(filters={"dangling": True})}
+        self.assertLessEqual(after, before)                              # nothing new is left untagged
+        self.assertEqual(sdk.images.list(filters={"label": f"{LABEL_TEST}={samples.RUN_ID}"}), [])
 
     def test_label_filter_limits_what_is_removed(self):
         tag = samples.build("idle").tag

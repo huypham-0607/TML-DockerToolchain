@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import requests
@@ -305,6 +306,63 @@ class TestGetStatus(unittest.TestCase):
             with self.assertRaises(LifecycleError) as ctx:
                 require_running(name)
             self.assertEqual(ctx.exception.code, code)
+
+
+class TestOomRecheck(unittest.TestCase):
+    """An exit with SIGKILL that just happened is looked at once more: the OOM flag can come late."""
+
+    def setUp(self):
+        patcher = mock.patch.object(status, "OOM_RECHECK_DELAY", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def ago(seconds: float) -> str:
+        return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    def test_late_oom_flag_is_seen(self):
+        container = FakeContainer(
+            make_attrs(status="exited", exit_code=137, finished=self.ago(0.2)),
+            after_reload=make_attrs(status="exited", exit_code=137, oom=True, finished=self.ago(0.2)),
+        )
+        use_fake(self, FakeClient(container))
+        s = get_status("tml-demo")
+        self.assertEqual((s.health, s.oom_killed), ("failed", True))
+
+    def test_plain_kill_stays_a_stop(self):
+        attrs = make_attrs(status="exited", exit_code=137, finished=self.ago(0.2))
+        container = FakeContainer(attrs, after_reload=attrs)
+        container.reload = mock.Mock(wraps=container.reload)
+        use_fake(self, FakeClient(container))
+        self.assertEqual(get_status("tml-demo").health, "stopped")
+        self.assertEqual(container.reload.call_count, status.OOM_RECHECK_ATTEMPTS)    # it looked, a limited number of times
+
+    def test_looking_stops_when_the_flag_appears(self):
+        late = make_attrs(status="exited", exit_code=137, oom=True, finished=self.ago(0.2))
+        container = FakeContainer(make_attrs(status="exited", exit_code=137, finished=self.ago(0.2)), after_reload=late)
+        container.reload = mock.Mock(wraps=container.reload)
+        use_fake(self, FakeClient(container))
+        self.assertTrue(get_status("tml-demo").oom_killed)
+        self.assertEqual(container.reload.call_count, 1)
+
+    def test_old_exit_is_not_looked_at_again(self):
+        container = FakeContainer(make_attrs(status="exited", exit_code=137, finished=self.ago(60)), after_reload=AssertionError("reloaded"))
+        use_fake(self, FakeClient(container))
+        self.assertEqual(get_status("tml-demo").health, "stopped")
+
+    def test_which_exits_are_looked_at(self):
+        now = datetime.now(timezone.utc)
+        recent = self.ago(1)
+        self.assertTrue(status.oom_may_be_pending(make_attrs(status="exited", exit_code=137, finished=recent), now))
+        self.assertFalse(status.oom_may_be_pending(make_attrs(status="exited", exit_code=137, oom=True, finished=recent), now))
+        self.assertFalse(status.oom_may_be_pending(make_attrs(status="exited", exit_code=143, finished=recent), now))
+        self.assertFalse(status.oom_may_be_pending(make_attrs(status="running"), now))
+        self.assertFalse(status.oom_may_be_pending(make_attrs(status="exited", exit_code=137, finished="not a time"), now))
+
+    def test_removed_while_looking(self):
+        gone = docker_errors.NotFound("404", explanation="No such container: tml-demo")
+        use_fake(self, FakeClient(FakeContainer(make_attrs(status="exited", exit_code=137, finished=self.ago(0.1)), after_reload=gone)))
+        self.assertEqual(get_status("tml-demo").health, "missing")
 
 
 class TestListing(unittest.TestCase):

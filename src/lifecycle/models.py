@@ -136,6 +136,7 @@ class ImageRef(_Serializable):
     id: str                   # short image id
     tag: str                  # reference to run it with
     built: bool = False       # True if this call built it (False: it already existed)
+    builder: str = ""         # buildkit | legacy when this call built it; empty otherwise
 
 
 @dataclass

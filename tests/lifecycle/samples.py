@@ -24,10 +24,13 @@ from src.lifecycle.models import LABEL_TEST, ContainerSpec, ImageRef, LifecycleE
 from src.lifecycle.provision import DEFAULT_MOUNT_ROOT, provision
 from src.lifecycle.teardown import destroy_all_managed, remove_built_images
 
-# Already on most development machines of this project; `docker build` pulls it once if not
+# The first build on a machine pulls it once
 BASE_IMAGE = os.environ.get("TML_TEST_BASE_IMAGE", "python:3.14-slim")
 
 RUN_ID = uuid.uuid4().hex[:8]
+
+# The user of this test run, for containers that write into a mounted directory
+HOST_USER = f"{os.getuid()}:{os.getgid()}"
 TEST_LABEL = {LABEL_TEST: RUN_ID}
 
 DOCKER_READY = client.docker_available()
@@ -154,7 +157,10 @@ def start_unmanaged(suffix: str):
 def mount_dir() -> Path:
     """A fresh directory that may be mounted: it is inside the default mount root (runs/).
 
-    A system temporary directory would not do: Docker Desktop does not share /tmp.
+    Inside the repository, not in /tmp, so that it also works where Docker shares only some
+    host directories (Docker Desktop). A container that writes into it must run as the current
+    user (`user=samples.HOST_USER`): with a rootful engine, files written as root stay root-owned
+    and cleanup could not delete them.
     """
     global _made_mount_root
     if not DEFAULT_MOUNT_ROOT.exists():

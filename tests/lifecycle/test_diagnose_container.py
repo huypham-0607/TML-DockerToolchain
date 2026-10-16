@@ -389,6 +389,26 @@ class TestDiagnoseLogic(unittest.TestCase):
         d = diagnose("tml-demo")
         self.assertEqual([(e["action"], e.get("exit_code")) for e in d.events], [("start", None), ("die", 3)])
 
+    def test_oom_event_counts_when_the_state_flag_is_missing(self):
+        _, fake = self.one(status="exited", exit_code=137)
+        fake.events_result = [
+            {"Action": "start", "time": 1791541201, "Actor": {"Attributes": {}}},
+            {"Action": "oom", "time": 1791541203, "Actor": {"Attributes": {}}},
+            {"Action": "die", "time": 1791541203, "Actor": {"Attributes": {"exitCode": "137"}}},
+        ]
+        d = diagnose("tml-demo")
+        self.assertTrue(d.status.oom_killed)
+        self.assertEqual(d.status.health, "failed")
+        self.assertIn("out of memory", d.status.reason)
+        self.assertEqual([(h.code, h.owner) for h in d.hints], [("out_of_memory", "lifecycle")])
+
+    def test_kill_without_an_oom_event_stays_a_kill(self):
+        _, fake = self.one(status="exited", exit_code=137)
+        fake.events_result = [{"Action": "kill", "time": 1791541203, "Actor": {"Attributes": {"signal": "9"}}}]
+        d = diagnose("tml-demo")
+        self.assertFalse(d.status.oom_killed)
+        self.assertEqual([h.code for h in d.hints], ["sigkill"])
+
     def test_events_are_asked_by_the_daemon_clock(self):
         container, fake = self.one(status="exited", exit_code=3, created="2026-10-09T10:00:00.123456789Z")
         diagnose("tml-demo")

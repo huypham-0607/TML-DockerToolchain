@@ -187,6 +187,11 @@ def remove_built_images(labels: dict[str, str] | None = None, force: bool = Fals
     An image that a container still uses is skipped (unless `force`), so destroy the
     containers first. Images that lifecycle did not build are never removed.
 
+    The untagged parent images of each removed image go too, down to the first parent that is
+    tagged (the base image) or still needed by another image. The classic builder keeps one
+    intermediate image per Dockerfile step, and with the containerd image store removing the
+    final image does not remove them.
+
     Args:
         labels: only images that also have these labels (label -> value).
         force: also remove an image that a stopped container still uses.
@@ -198,6 +203,7 @@ def remove_built_images(labels: dict[str, str] | None = None, force: bool = Fals
 
     removed: list[str] = []
     for image in images:
+        parents = _untagged_parents(sdk, image)
         for tag in image.tags or [image.id]:
             with client.translated(f"remove image {tag!r}"):
                 try:
@@ -209,4 +215,31 @@ def remove_built_images(labels: dict[str, str] | None = None, force: bool = Fals
                         raise
                     continue   # still used by a container
             removed.append(tag)
+        _remove_parents(sdk, parents)
     return removed
+
+
+def _untagged_parents(sdk, image) -> list[str]:
+    """Ids of the untagged images below `image`, nearest first (classic builds record a Parent)."""
+    chain: list[str] = []
+    parent = (image.attrs or {}).get("Parent") or ""
+    while parent and len(chain) < 200:
+        try:
+            with client.translated(f"inspect image {parent[:19]!r}"):
+                found = sdk.images.get(parent)
+        except LifecycleError:
+            break
+        if found.tags:
+            break   # a tagged image (the base image, or someone else's): never ours to remove
+        chain.append(found.id)
+        parent = (found.attrs or {}).get("Parent") or ""
+    return chain
+
+
+def _remove_parents(sdk, parents: list[str]) -> None:
+    for image_id in parents:
+        try:
+            with client.translated(f"remove image {image_id[:19]!r}"):
+                sdk.images.remove(image_id)
+        except LifecycleError:
+            return   # gone already, or still the parent of another image: what is below stays too

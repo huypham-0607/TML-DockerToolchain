@@ -71,6 +71,19 @@ class TestTranslate(unittest.TestCase):
         exc = docker_errors.DockerException("Error while fetching server API version: ('Connection aborted.', FileNotFoundError(2, 'No such file or directory'))")
         self.assertEqual(self.code(exc), "docker_unavailable")
 
+    def test_socket_permission(self):
+        exc = docker_errors.DockerException("Error while fetching server API version: ('Connection aborted.', PermissionError(13, 'Permission denied'))")
+        err = client.translate(exc)
+        self.assertEqual(err.code, "docker_unavailable")
+        self.assertIn("docker group", err.hint)
+        exc = requests.exceptions.ConnectionError("('Connection aborted.', PermissionError(13, 'Permission denied'))")
+        self.assertIn("docker group", client.translate(exc).hint)
+
+    def test_permission_error_from_the_daemon_is_not_about_the_socket(self):
+        # an APIError comes from a daemon that answered: the socket itself was fine
+        err = client.translate(api_error(500, "error while creating mount source path '/data': permission denied"))
+        self.assertEqual(err.code, "docker_error")
+
     def test_timeout(self):
         self.assertEqual(self.code(requests.exceptions.ReadTimeout("Read timed out. (read timeout=30)")), "timeout")
 
@@ -172,6 +185,28 @@ class TestRuntimeDetection(unittest.TestCase):
     @requires_docker
     def test_live_daemon_answers(self):
         self.assertIsInstance(client.has_nvidia_runtime(), bool)
+        self.assertIsInstance(client.gpu_available(), bool)
+
+    def test_gpu_through_the_nvidia_runtime(self):
+        self.assertTrue(client.gpu_available({"Runtimes": {"nvidia": {}}}))
+
+    def test_gpu_as_a_cdi_device(self):
+        info = {"Runtimes": {"runc": {}}, "DiscoveredDevices": [{"Source": "cdi", "ID": "nvidia.com/gpu=0"}]}
+        self.assertTrue(client.gpu_available(info))
+        self.assertFalse(client.has_nvidia_runtime(info))             # the runtime check alone would miss it
+
+    def test_no_gpu(self):
+        for info in (
+            {"Runtimes": {"runc": {}}},
+            {"Runtimes": {"runc": {}}, "DiscoveredDevices": None},
+            {"Runtimes": {"runc": {}}, "DiscoveredDevices": [{"Source": "cdi", "ID": "vendor.example/fpga=0"}]},
+            {},
+        ):
+            self.assertFalse(client.gpu_available(info), info)
+
+    def test_gpu_reads_daemon_info_when_not_given(self):
+        use_fake(self, FakeClient(info={"DiscoveredDevices": [{"Source": "cdi", "ID": "nvidia.com/gpu=all"}]}))
+        self.assertTrue(client.gpu_available())
 
 
 if __name__ == "__main__":

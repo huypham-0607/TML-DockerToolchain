@@ -236,16 +236,18 @@ def all_labels_match(labels: dict, wanted: list[str]) -> bool:
 
 
 class FakeImage:
-    def __init__(self, tag: str, image_id: str = "sha256:" + "51dafde81dbd" + "0" * 52, labels: dict | None = None):
+    def __init__(self, tag: str, image_id: str = "sha256:" + "51dafde81dbd" + "0" * 52, labels: dict | None = None, parent: str = ""):
         self.id = image_id
-        self.tags = [tag]
+        self.tags = [tag] if tag else []
         self.labels = labels or {}
+        self.attrs = {"Id": image_id, "Parent": parent}
 
 
 class FakeImages:
     """Only the images given to it exist; like lifecycle, it never pulls.
 
     `remove_errors` maps a tag (or id) to the exception that remove() raises for it.
+    Removing an image by id while another image names it as Parent is a 409 conflict, like Docker.
     """
 
     def __init__(self, images, remove_errors: dict | None = None):
@@ -267,6 +269,8 @@ class FakeImages:
         if name in self.remove_errors:
             raise self.remove_errors[name]
         for image in self._images:
+            if name == image.id and any(child.attrs.get("Parent") == image.id for child in self._images):
+                raise _conflict(f"conflict: unable to delete {name[:19]} (cannot be forced) - image has dependent child images")
             if name in image.tags or name == image.id:
                 image.tags = [t for t in image.tags if t != name]
                 if not image.tags:
@@ -282,6 +286,41 @@ class FakeImages:
         raise docker_errors.ImageNotFound("404 Client Error: Not Found", explanation=f"No such image: {name}")
 
 
+class FakeApi:
+    """The low-level SDK client, for the classic builder: build() yields stream chunks.
+
+    `outcomes` holds one entry per build() call (the last one repeats): a list of chunks,
+    or an exception to raise. A build whose chunks have no "error" adds its tag to `images`.
+    """
+
+    def __init__(self, images: "FakeImages", outcomes=None):
+        self.images = images
+        self.outcomes = outcomes if outcomes is not None else [[{"stream": "Step 1/1 : FROM scratch\n"}, {"stream": "Successfully built 1\n"}]]
+        self.build_calls: list[dict] = []
+        self.auth_shadowed: list[bool] = []    # per call: was the credential lookup switched off?
+        self.closed = 0
+
+    def build(self, **kwargs):
+        self.build_calls.append(kwargs)
+        self.auth_shadowed.append("_set_auth_headers" in self.__dict__)
+        outcome = self.outcomes[min(len(self.build_calls), len(self.outcomes)) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        if not any("error" in chunk for chunk in outcome):
+            n = len(self.images._images) + 1
+            self.images._images.append(FakeImage(kwargs["tag"], image_id="sha256:" + f"{n:02x}" * 32, labels=kwargs.get("labels")))
+        return self._stream(outcome)
+
+    def _stream(self, chunks):
+        try:
+            yield from chunks
+        finally:
+            self.closed += 1
+
+    def _set_auth_headers(self, headers):
+        """Stands for the SDK method that reads registry credentials."""
+
+
 class FakeClient:
     """SDK DockerClient stand-in. `error` makes every container call raise it."""
 
@@ -291,6 +330,7 @@ class FakeClient:
     ):
         self.containers = FakeContainers(containers, error)
         self.images = FakeImages(images, image_remove_errors)
+        self.api = FakeApi(self.images)
         self.events_result: list | Exception = []   # what events() yields; an exception is raised
         self.event_calls: list[dict] = []
         self._info = info if info is not None else {"Runtimes": {"runc": {"path": "runc"}}, "MemTotal": 16 * 1024**3}
@@ -314,6 +354,10 @@ def use_fake(test, fake: FakeClient) -> FakeClient:
     patcher.start()
     test.addCleanup(patcher.stop)
     return fake
+
+
+def _conflict(explanation: str) -> docker_errors.APIError:
+    return api_error(409, explanation)
 
 
 def api_error(status_code: int, explanation: str) -> docker_errors.APIError:

@@ -17,7 +17,9 @@
 
 from __future__ import annotations
 
+import re
 import time
+from datetime import datetime, timezone
 
 from . import client
 from .models import (
@@ -37,6 +39,13 @@ PROBE_COMMAND = ["true"]
 # Seconds before a failed probe is checked again
 PROBE_RETRY_DELAY = 0.3
 
+# A container killed at its memory limit can be reported as exited before Docker records the OOM
+# kill (under load, more than a second later). An exit with SIGKILL this recent is looked at again,
+# every OOM_RECHECK_DELAY seconds, up to OOM_RECHECK_ATTEMPTS times.
+OOM_RECHECK_WINDOW = 5.0
+OOM_RECHECK_DELAY = 0.25
+OOM_RECHECK_ATTEMPTS = 8
+
 
 # ---------------------------------------------------------------- pure helpers
 
@@ -46,6 +55,27 @@ def is_managed(attrs: dict) -> bool:
 
 def _time(value: str | None) -> str | None:
     return None if not value or value == _ZERO_TIME else value
+
+
+def parse_time(value: str) -> datetime:
+    """Parses a Docker / ISO 8601 timestamp (nanoseconds and a trailing Z are accepted)."""
+    text = value.strip().replace("Z", "+00:00")
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)   # datetime keeps microseconds only
+    parsed = datetime.fromisoformat(text)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def oom_may_be_pending(attrs: dict, now: datetime | None = None) -> bool:
+    """True for a container that exited with SIGKILL just now and has no OOM flag (yet)."""
+    state = attrs.get("State") or {}
+    if state.get("Status") != "exited" or state.get("ExitCode") != 137 or state.get("OOMKilled"):
+        return False
+    try:
+        finished = parse_time(state.get("FinishedAt") or "")
+    except ValueError:
+        return False
+    age = ((now or datetime.now(timezone.utc)) - finished).total_seconds()
+    return age < OOM_RECHECK_WINDOW
 
 
 def handle_from_attrs(attrs: dict) -> ContainerHandle:
@@ -198,7 +228,26 @@ def _running(obj) -> bool:
     return (obj.attrs.get("State") or {}).get("Status") == "running"
 
 
+def _reload(obj, asked: str) -> ContainerStatus | None:
+    """Inspects the container again. Returns a "missing" status if it was removed meanwhile."""
+    try:
+        with client.translated(f"inspect container {obj.name!r}"):
+            obj.reload()
+    except LifecycleError as e:
+        if e.code == "not_found":
+            return _missing(asked or obj.name)
+        raise
+    return None
+
+
 def _status_of(obj, probe: bool, asked: str = "") -> ContainerStatus:
+    if oom_may_be_pending(obj.attrs):
+        for _ in range(OOM_RECHECK_ATTEMPTS):
+            time.sleep(OOM_RECHECK_DELAY)
+            if (gone := _reload(obj, asked)) is not None:
+                return gone
+            if (obj.attrs.get("State") or {}).get("OOMKilled"):
+                break
     state = obj.attrs.get("State") or {}
     # the probe only decides when the container runs and the image has no HEALTHCHECK
     probe_ok = None
@@ -208,13 +257,8 @@ def _status_of(obj, probe: bool, asked: str = "") -> ContainerStatus:
             # a failed probe usually means the main process has just exited: give the daemon
             # a moment to record that, then look again before calling the container unhealthy
             time.sleep(PROBE_RETRY_DELAY)
-            try:
-                with client.translated(f"inspect container {obj.name!r}"):
-                    obj.reload()
-            except LifecycleError as e:
-                if e.code == "not_found":
-                    return _missing(asked or obj.name)
-                raise
+            if (gone := _reload(obj, asked)) is not None:
+                return gone
             probe_ok = _probe(obj) if _running(obj) else None
     return status_from_attrs(obj.attrs, probe_ok, asked)
 

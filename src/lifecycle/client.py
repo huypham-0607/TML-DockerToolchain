@@ -22,6 +22,12 @@ from .models import LifecycleError
 # Seconds to wait for one daemon request
 DEFAULT_TIMEOUT = 30
 
+# The daemon socket of a rootful engine is open to root and the docker group only
+SOCKET_PERMISSION_HINT = (
+    "this user may not use the Docker socket: add it to the docker group "
+    "(sudo usermod -aG docker $USER), then log in again"
+)
+
 _client: docker.DockerClient | None = None
 
 
@@ -59,11 +65,22 @@ def docker_available() -> bool:
 
 
 def has_nvidia_runtime(info: dict | None = None) -> bool:
-    """True if the daemon has an NVIDIA runtime, i.e. containers can get a GPU."""
+    """True if the daemon has an NVIDIA runtime (nvidia-container-toolkit in runtime mode)."""
     if info is None:
         with translated("read the daemon info"):
             info = get_client().info()
     return "nvidia" in (info.get("Runtimes") or {})
+
+
+def gpu_available(info: dict | None = None) -> bool:
+    """True if containers can get an NVIDIA GPU: through the NVIDIA runtime, or as a CDI device
+    (newer engines list CDI devices under DiscoveredDevices)."""
+    if info is None:
+        with translated("read the daemon info"):
+            info = get_client().info()
+    devices = info.get("DiscoveredDevices") or []
+    cdi_gpu = any(str(d.get("ID", "")).startswith("nvidia.com/gpu") for d in devices if isinstance(d, dict))
+    return has_nvidia_runtime(info) or cdi_gpu
 
 
 def translate(exc: BaseException, what: str = "") -> LifecycleError:
@@ -106,6 +123,9 @@ def translate(exc: BaseException, what: str = "") -> LifecycleError:
         return err("docker_error")
     if isinstance(exc, requests.exceptions.Timeout):
         return err("timeout", "the daemon did not answer in time")
+    if "permission denied" in low:
+        # not an APIError (handled above): the socket itself refused this user
+        return err("docker_unavailable", SOCKET_PERMISSION_HINT)
     if isinstance(exc, (requests.exceptions.ConnectionError, docker_errors.DockerException)):
         return err("docker_unavailable", "check that the Docker daemon is running and that this user can reach it")
     return err("docker_error")

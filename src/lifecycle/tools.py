@@ -152,7 +152,7 @@ def provision_container(
         ports: published ports, "host_port:container_port" or "container_port"; reachable from this machine only.
         memory: memory limit, for example "8g"; empty uses the default limit.
         shm_size: size of /dev/shm, for example "8g"; raise it when DataLoader workers fail with a Bus error.
-        user: user to run as, for example "1000:1000"; use it when a mounted directory is not writable.
+        user: user to run as, for example "1000:1000". Files the container writes into a mount belong to this user on the host (root if empty); use the host user's ids when the results must stay editable.
         ready_timeout: seconds to wait for readiness; 0 uses the default (30, or 120 with an image HEALTHCHECK).
         replace: remove an existing container of this name that has different settings.
     """

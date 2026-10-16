@@ -516,11 +516,13 @@ class TestOptions(LiveCase):
     def test_mount_from_the_default_root(self):
         data = samples.mount_dir()
         (data / "x.txt").write_text("hello")
-        r = samples.start("idle", "opt-mount", mounts=[f"{data}:/data"])
+        # as this user: with a rootful engine, a file written as root would stay root-owned on the host
+        r = samples.start("idle", "opt-mount", mounts=[f"{data}:/data"], user=samples.HOST_USER)
         self.assertTrue(r.ok)
         self.assertEqual(r.handle.mounts, [f"{data}:/data"])
         self.assertEqual(self.run_in(r, "cat /data/x.txt; echo written > /data/y.txt"), "hello")
         self.assertEqual((data / "y.txt").read_text().strip(), "written")
+        self.assertEqual((data / "y.txt").stat().st_uid, os.getuid())   # cleanup can delete it
 
     def test_read_only_mount(self):
         data = samples.mount_dir()
@@ -562,7 +564,7 @@ class TestOptions(LiveCase):
     def test_gpu_auto_follows_the_daemon(self):
         r = samples.start("idle", "opt-gpu-auto", gpu="auto")
         self.assertTrue(r.ok)
-        self.assertEqual(r.handle.gpu, client.has_nvidia_runtime())
+        self.assertEqual(r.handle.gpu, client.gpu_available())
 
     def test_gpu_all(self):
         # with a GPU: the container gets it. Without one: a clear error and no leftover container.
@@ -608,6 +610,66 @@ class TestDockerfileInput(LiveCase):
         self.assertEqual(ctx.exception.code, "invalid_argument")
 
 
+class TestCreateAndStart(unittest.TestCase):
+    """Creating and starting, with the retry for an engine that has no docker-init."""
+
+    NO_INIT = LifecycleError("docker_error", 'could not start container \'tml-x\': exec: "docker-init": executable file not found in $PATH')
+
+    def sdk(self, *start_outcomes) -> mock.Mock:
+        """A fake SDK client; each created container's start() takes the next outcome (None = works)."""
+        sdk = mock.Mock()
+        created = []
+
+        def create(**kwargs):
+            obj = mock.Mock(name=f"container{len(created)}")
+            outcome = start_outcomes[len(created)]
+            obj.start.side_effect = outcome
+            obj.kwargs = kwargs
+            created.append(obj)
+            return obj
+
+        sdk.containers.create.side_effect = create
+        sdk.created = created
+        return sdk
+
+    def test_normal_start(self):
+        sdk = self.sdk(None)
+        obj = provision_module._create_and_start(sdk, {"name": "tml-x", "init": True}, "tml-x")
+        self.assertIs(obj, sdk.created[0])
+        self.assertTrue(obj.kwargs["init"])
+        obj.remove.assert_not_called()
+
+    def test_engine_without_docker_init(self):
+        sdk = self.sdk(self.NO_INIT, None)
+        kwargs = {"name": "tml-x", "init": True}
+        obj = provision_module._create_and_start(sdk, kwargs, "tml-x")
+        self.assertEqual(len(sdk.created), 2)
+        sdk.created[0].remove.assert_called_once_with(force=True, v=True)    # the first try is cleared away
+        self.assertIs(obj, sdk.created[1])
+        self.assertFalse(obj.kwargs["init"])
+        self.assertTrue(kwargs["init"])                                       # the caller's arguments are untouched
+
+    def test_other_start_errors_are_not_retried(self):
+        sdk = self.sdk(LifecycleError("port_conflict", "port is already allocated"))
+        with self.assertRaises(LifecycleError) as ctx:
+            provision_module._create_and_start(sdk, {"name": "tml-x", "init": True}, "tml-x")
+        self.assertEqual(ctx.exception.code, "port_conflict")
+        self.assertEqual(len(sdk.created), 1)
+        sdk.created[0].remove.assert_called_once_with(force=True, v=True)
+
+    def test_only_one_retry(self):
+        sdk = self.sdk(self.NO_INIT, self.NO_INIT)
+        with self.assertRaises(LifecycleError):
+            provision_module._create_and_start(sdk, {"name": "tml-x", "init": True}, "tml-x")
+        self.assertEqual(len(sdk.created), 2)                                 # the second try already had no init
+
+    def test_create_that_fails(self):
+        sdk = mock.Mock()
+        sdk.containers.create.side_effect = LifecycleError("docker_error", "invalid mount config")
+        with self.assertRaises(LifecycleError):
+            provision_module._create_and_start(sdk, {"name": "tml-x", "init": True}, "tml-x")
+
+
 class TestFinish(unittest.TestCase):
     """The last step of provision: wait for readiness, and diagnose a container that is not usable."""
 
@@ -648,6 +710,18 @@ class TestFinish(unittest.TestCase):
         result, diagnose_mock = self.finish("completed", mode="idle", diagnosis=Diagnosis(status=ContainerStatus("c", "exited", "completed")))
         self.assertFalse(result.ok)
         diagnose_mock.assert_called_once()
+
+    def test_late_oom_flag_from_the_diagnosis_is_adopted(self):
+        late = ContainerStatus(container="tml-demo", state="exited", health="failed", exit_code=137, oom_killed=True,
+                               reason="killed by the kernel: out of memory (exit code 137)")
+        result, _ = self.finish("stopped", diagnosis=Diagnosis(status=late))
+        self.assertIs(result.status, late)
+        self.assertEqual((result.status.health, result.status.oom_killed), ("failed", True))
+
+    def test_other_diagnosis_status_is_not_adopted(self):
+        other = ContainerStatus(container="tml-demo", state="exited", health="failed", exit_code=3)
+        result, _ = self.finish("failed", diagnosis=Diagnosis(status=other))
+        self.assertIsNot(result.status, other)
 
     def test_diagnosis_that_cannot_be_read_does_not_hide_the_status(self):
         result, _ = self.finish("failed", diagnosis=LifecycleError("docker_unavailable", "daemon went away"))

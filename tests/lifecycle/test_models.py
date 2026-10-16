@@ -81,7 +81,9 @@ class TestSerialization(unittest.TestCase):
         self.assertEqual(data["mounts"], ["/a:/b"])
 
     def test_image_ref(self):
-        self.assertEqual(self.roundtrip(ImageRef(id="51dafde81dbd", tag="tml-local/demo:abc", built=True))["built"], True)
+        data = self.roundtrip(ImageRef(id="51dafde81dbd", tag="tml-local/demo:abc", built=True, builder="legacy"))
+        self.assertEqual((data["built"], data["builder"]), (True, "legacy"))
+        self.assertEqual(ImageRef(id="1", tag="t").builder, "")      # not built by this call: no builder
 
     def test_handle(self):
         data = self.roundtrip(self.handle())
@@ -160,7 +162,7 @@ class TestProvisionResult(unittest.TestCase):
         self.assertEqual(set(data), {"ok", "action", "image", "status", "diagnosis"})
         self.assertIs(data["ok"], True)
         self.assertEqual(data["action"], "created")
-        self.assertEqual(data["image"], {"id": "51dafde81dbd", "tag": "demo:1", "built": False})
+        self.assertEqual(data["image"], {"id": "51dafde81dbd", "tag": "demo:1", "built": False, "builder": ""})
         self.assertTrue(data["status"]["usable"])                # status keeps its derived fields
         self.assertIsNone(data["diagnosis"])
 

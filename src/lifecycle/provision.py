@@ -238,6 +238,31 @@ def _discard(obj) -> None:
         pass
 
 
+def _missing_init(error: LifecycleError) -> bool:
+    """True if the engine has no docker-init binary (some minimal installs leave it out)."""
+    return "docker-init" in error.message.lower()
+
+
+def _create_and_start(sdk, kwargs: dict, name: str):
+    """Creates and starts the container. Without docker-init on this engine, it tries once more
+    without init: the container works, but a stop then needs its timeout and SIGKILL."""
+    while True:
+        obj = None
+        try:
+            with client.translated(f"create container {name!r}"):
+                obj = sdk.containers.create(**kwargs)
+            with client.translated(f"start container {name!r}"):
+                obj.start()
+            return obj
+        except LifecycleError as e:
+            if obj is not None:
+                _discard(obj)   # never started: nothing to diagnose, and it would block the name
+            if kwargs.get("init") and _missing_init(e):
+                kwargs = {**kwargs, "init": False}
+                continue
+            raise
+
+
 def _has_healthcheck(obj) -> bool:
     test = ((obj.attrs.get("Config") or {}).get("Healthcheck") or {}).get("Test") or []
     return bool(test) and test != ["NONE"]
@@ -251,6 +276,10 @@ def _finish(name: str, image, action: str, timeout: float) -> ProvisionResult:
             result.diagnosis = diagnose(name)
         except LifecycleError:
             pass   # the status already says that it failed; a diagnosis that cannot be read must not hide it
+        else:
+            # the diagnosis looked later and also at the daemon's events: an OOM kill it found is the truth
+            if result.diagnosis.status.oom_killed and not result.status.oom_killed:
+                result.status = result.diagnosis.status
     return result
 
 
@@ -287,7 +316,7 @@ def provision(spec: ContainerSpec, replace: bool = False, ready_timeout: float |
 
     with client.translated("read the daemon info"):
         info = sdk.info()
-    use_gpu = spec.gpu == "all" or (spec.gpu == "auto" and client.has_nvidia_runtime(info))
+    use_gpu = spec.gpu == "all" or (spec.gpu == "auto" and client.gpu_available(info))
 
     name = spec.name or generate_name(image.tag)
     kwargs = build_create_kwargs(spec, image.tag, name, use_gpu, default_memory(info))
@@ -321,14 +350,6 @@ def provision(spec: ContainerSpec, replace: bool = False, ready_timeout: float |
             existing.remove(force=True, v=True)
         action = "replaced"
 
-    with client.translated(f"create container {name!r}"):
-        obj = sdk.containers.create(**kwargs)
-    try:
-        with client.translated(f"start container {name!r}"):
-            obj.start()
-    except LifecycleError:
-        _discard(obj)   # never started: nothing to diagnose, and it would block the name
-        raise
-
+    obj = _create_and_start(sdk, kwargs, name)
     timeout = ready_timeout or (HEALTHCHECK_READY_TIMEOUT if _has_healthcheck(obj) else READY_TIMEOUT)
     return _finish(name, image, action, timeout)

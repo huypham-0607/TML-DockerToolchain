@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import client
 from .models import ContainerLogs, ContainerStatus, Diagnosis, Hint, LifecycleError
-from .status import get_status, require_managed
+from .status import get_status, parse_time, require_managed
 
 
 # Lines of each stream that get_logs returns by default, and the most it accepts
@@ -297,14 +297,6 @@ def split_budget(stdout: str, stderr: str, max_chars: int) -> tuple[int, int]:
     return half, max_chars - half
 
 
-def parse_time(value: str) -> datetime:
-    """Parses a Docker / ISO 8601 timestamp (nanoseconds and a trailing Z are accepted)."""
-    text = value.strip().replace("Z", "+00:00")
-    text = re.sub(r"(\.\d{6})\d+", r"\1", text)   # datetime keeps microseconds only
-    parsed = datetime.fromisoformat(text)
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-
-
 def parse_since(since: str, now: datetime) -> datetime | None:
     """Turns `since` into a point in time.
 
@@ -490,7 +482,7 @@ def diagnose(container: str, tail: int = DIAGNOSIS_TAIL) -> Diagnosis:
         # removed between the two looks
         return Diagnosis(status=get_status(container))
 
-    diagnosis = Diagnosis(status=status, logs=logs, hints=classify_failure(status, logs))
+    diagnosis = Diagnosis(status=status, logs=logs)
 
     def best_effort(part: str, read):
         try:
@@ -504,4 +496,9 @@ def diagnose(container: str, tail: int = DIAGNOSIS_TAIL) -> Diagnosis:
         diagnosis.processes = best_effort("processes", lambda: _processes(obj)) or []
         diagnosis.resources = best_effort("resource use", lambda: summarize_stats(obj.stats(stream=False))) or {}
     diagnosis.events = best_effort("events", lambda: _events(obj, status)) or []
+    if not status.oom_killed and any(e["action"] == "oom" for e in diagnosis.events):
+        # the daemon's oom event is proof even when the state flag was not set (yet)
+        status.oom_killed = True
+        status.health, status.reason = "failed", f"killed by the kernel: out of memory (exit code {status.exit_code})"
+    diagnosis.hints = classify_failure(status, logs)
     return diagnosis
