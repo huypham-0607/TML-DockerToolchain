@@ -511,4 +511,15 @@ def diagnose(container: str, tail: int = DIAGNOSIS_TAIL) -> Diagnosis:
         status.health, status.reason = "failed", f"killed by the kernel: out of memory (exit code {status.exit_code})"
     host_gpu = best_effort("GPU availability", client.gpu_available)
     diagnosis.hints = classify_failure(status, logs, host_gpu)
+    if (
+        host_gpu and status.handle is not None
+        and any(h.code == "cuda_runtime" and h.owner == "lifecycle" for h in diagnosis.hints)
+        and not best_effort("GPU history", lambda: client.gpu_attach_known(client.get_client().info()))
+    ):
+        # The hint would send the agent to gpu='all', but nothing has tried a GPU on this daemon yet,
+        # and a listed GPU does not have to work (Docker Desktop lists one without NVIDIA hardware).
+        # Try it once now, from the same image, so the hint is right the first time.
+        image = status.handle.image or status.handle.image_id
+        if best_effort("GPU probe", lambda: client.probe_gpu_attach(image)) is False:
+            diagnosis.hints = classify_failure(status, logs, False)
     return diagnosis

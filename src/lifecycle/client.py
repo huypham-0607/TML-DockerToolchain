@@ -10,8 +10,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
+import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import docker
 import requests
@@ -36,6 +41,12 @@ SOCKET_PERMISSION_HINT = (
     "this user may not use the Docker socket: add it to the docker group "
     "(sudo usermod -aG docker $USER), then log in again"
 )
+
+# A daemon can list a GPU that it cannot attach (Docker Desktop registers the NVIDIA runtime even
+# without an NVIDIA GPU). The outcome of a real attach is remembered per daemon in this file.
+CACHE_DIR_ENV = "TML_CACHE_DIR"
+GPU_STATE_FILE = "gpu_attach.json"
+GPU_STATE_TTL = 7 * 24 * 3600   # seconds; afterwards a GPU is tried again
 
 _client: docker.DockerClient | None = None
 
@@ -81,15 +92,148 @@ def has_nvidia_runtime(info: dict | None = None) -> bool:
     return "nvidia" in (info.get("Runtimes") or {})
 
 
-def gpu_available(info: dict | None = None) -> bool:
-    """True if containers can get an NVIDIA GPU: through the NVIDIA runtime, or as a CDI device
-    (newer engines list CDI devices under DiscoveredDevices)."""
+def _cdi_gpus(info: dict) -> list[str]:
+    devices = info.get("DiscoveredDevices") or []
+    return sorted(str(d.get("ID", "")) for d in devices if isinstance(d, dict) and str(d.get("ID", "")).startswith("nvidia.com/gpu"))
+
+
+def _info(info: dict | None) -> dict:
     if info is None:
         with translated("read the daemon info"):
             info = get_client().info()
-    devices = info.get("DiscoveredDevices") or []
-    cdi_gpu = any(str(d.get("ID", "")).startswith("nvidia.com/gpu") for d in devices if isinstance(d, dict))
-    return has_nvidia_runtime(info) or cdi_gpu
+    return info
+
+
+def gpu_claimed(info: dict | None = None) -> bool:
+    """True if the daemon lists an NVIDIA GPU: the NVIDIA runtime, or a CDI device (newer engines list
+    CDI devices under DiscoveredDevices). A listed GPU does not have to work: see gpu_available()."""
+    info = _info(info)
+    return has_nvidia_runtime(info) or bool(_cdi_gpus(info))
+
+
+def gpu_available(info: dict | None = None) -> bool:
+    """True if containers can get an NVIDIA GPU: the daemon lists one, and an earlier attach on this
+    daemon did not fail (in the last GPU_STATE_TTL seconds)."""
+    info = _info(info)
+    return gpu_claimed(info) and not gpu_attach_failed(info)
+
+
+# ---------------------------------------------------------------- remembered GPU attach outcome
+
+def cache_dir() -> Path:
+    """$TML_CACHE_DIR, else $XDG_CACHE_HOME/tml-dockertoolchain, else ~/.cache/tml-dockertoolchain."""
+    if custom := os.environ.get(CACHE_DIR_ENV):
+        return Path(custom).expanduser()
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "tml-dockertoolchain"
+
+
+def gpu_state_path() -> Path:
+    return cache_dir() / GPU_STATE_FILE
+
+
+def gpu_daemon_key(info: dict) -> str:
+    """Identifies a daemon and its GPU setup: a new runtime or CDI device gives a new key, so a
+    remembered failure does not outlive a change of the setup."""
+    parts = {
+        "id": info.get("ID", ""), "version": info.get("ServerVersion", ""),
+        "runtimes": sorted(info.get("Runtimes") or {}), "cdi": _cdi_gpus(info),
+    }
+    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _read_gpu_state() -> dict:
+    try:
+        state = json.loads(gpu_state_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _write_gpu_state(state: dict) -> None:
+    """Best effort: a cache that cannot be written only costs one more failed GPU attach."""
+    path = gpu_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=1))
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def gpu_attach_failed(info: dict) -> bool:
+    """True if a GPU attach failed on this daemon (same GPU setup) in the last GPU_STATE_TTL seconds."""
+    entry = _read_gpu_state().get(gpu_daemon_key(info))
+    if not isinstance(entry, dict):
+        return False
+    try:
+        return time.time() - float(entry.get("failed_at", 0)) < GPU_STATE_TTL
+    except (TypeError, ValueError):
+        return False
+
+
+def gpu_attach_known(info: dict) -> bool:
+    """True if a GPU attach on this daemon (same GPU setup) worked or failed in the last GPU_STATE_TTL seconds."""
+    entry = _read_gpu_state().get(gpu_daemon_key(info))
+    if not isinstance(entry, dict):
+        return False
+    try:
+        at = float(entry.get("failed_at") or entry.get("worked_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return time.time() - at < GPU_STATE_TTL
+
+
+def remember_gpu_attach(info: dict, worked: bool, detail: str = "") -> None:
+    """Records the outcome of a real GPU attach on this daemon."""
+    state = _read_gpu_state()
+    entry = {"worked_at": time.time()} if worked else {"failed_at": time.time(), "detail": detail[:300]}
+    state[gpu_daemon_key(info)] = entry
+    _write_gpu_state(state)
+
+
+def probe_gpu_attach(image: str, info: dict | None = None) -> bool:
+    """Tries once to start a container with a GPU, and remembers the outcome.
+
+    The container comes from `image` (already on this machine: nothing is pulled), runs nothing
+    of the image (`true`), and is always removed. Only the attach counts: a start that passes the
+    GPU step is a success even if the image has no `true`.
+
+    Raises LifecycleError for problems that are not about the GPU (missing image, daemon down).
+    """
+    from docker.types import DeviceRequest
+
+    info = _info(info)
+    sdk = get_client()
+    with translated(f"create a GPU probe container from {image!r}"):
+        probe = sdk.containers.create(
+            image, entrypoint=["true"], labels={"tml.probe": "gpu"}, init=True,   # init: the start passes even without `true`
+            device_requests=[DeviceRequest(count=-1, capabilities=[["gpu"]])],
+        )
+    try:
+        try:
+            with translated("start the GPU probe container"):
+                probe.start()
+        except LifecycleError as e:
+            if e.code != "gpu_unavailable":
+                raise
+            remember_gpu_attach(info, worked=False, detail=e.message)
+            return False
+        remember_gpu_attach(info, worked=True)
+        return True
+    finally:
+        try:
+            probe.remove(force=True, v=True)
+        except Exception:
+            pass
+
+
+def forget_gpu_attach() -> None:
+    """Forgets every remembered outcome: the next gpu="auto" tries the GPU again."""
+    try:
+        gpu_state_path().unlink()
+    except OSError:
+        pass
 
 
 def translate(exc: BaseException, what: str = "") -> LifecycleError:
