@@ -146,7 +146,7 @@ def provision_container(
         name: container name; one is generated when empty.
         mode: "idle" keeps the container running for later commands (default); "native" runs the image's own command.
         command: native mode only: the command to run instead of the image's CMD.
-        gpu: "auto" (use a GPU if this machine has one), "all", or "none".
+        gpu: "auto" (use a GPU if Docker can attach one, otherwise start without), "all" (fail without a GPU), or "none".
         env: environment variables, for example {"SEED": "1"}.
         mounts: host directories, "host_path:container_path" or "host_path:container_path:ro"; only from allowed directories.
         ports: published ports, "host_port:container_port" or "container_port"; reachable from this machine only.
@@ -168,6 +168,7 @@ def provision_container(
             "action": result.action,
             "image": asdict(result.image),
             "status": status_view(result.status),
+            "notes": result.notes,
         }
         if result.diagnosis is not None:
             reply["diagnosis"] = diagnosis_view(result.diagnosis, with_status=False)

@@ -210,10 +210,15 @@ def build_create_kwargs(
     return kwargs
 
 
-def spec_fingerprint(kwargs: dict, image_id: str) -> str:
-    """Identifies the image and settings of a container (not its name or labels)."""
-    settings = {k: v for k, v in kwargs.items() if k not in ("name", "labels")}
-    payload = json.dumps({"image_id": image_id, "settings": settings}, sort_keys=True, default=str)
+def spec_fingerprint(kwargs: dict, image_id: str, gpu: str = "") -> str:
+    """Identifies the image and settings of a container (not its name or labels).
+
+    The GPU counts as the requested option (`gpu`), not as the resolved device request: with
+    gpu="auto" the request can come and go as the daemon's GPU turns out to work or not, and the
+    same container must still be reused.
+    """
+    settings = {k: v for k, v in kwargs.items() if k not in ("name", "labels", "device_requests")}
+    payload = json.dumps({"image_id": image_id, "gpu": gpu, "settings": settings}, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
@@ -243,9 +248,18 @@ def _missing_init(error: LifecycleError) -> bool:
     return "docker-init" in error.message.lower()
 
 
-def _create_and_start(sdk, kwargs: dict, name: str):
-    """Creates and starts the container. Without docker-init on this engine, it tries once more
-    without init: the container works, but a stop then needs its timeout and SIGKILL."""
+def _create_and_start(
+    sdk, kwargs: dict, name: str, gpu_optional: bool = False,
+    notes: list[str] | None = None, info: dict | None = None,
+):
+    """Creates and starts the container, and tries once more when something optional is missing:
+
+      - no docker-init on this engine: without init (it works, but a stop then needs its timeout)
+      - gpu_optional (gpu="auto") and the GPU cannot be attached: without a GPU
+
+    What it had to leave out is added to `notes`. With the daemon's `info`, the outcome of a GPU
+    attach is remembered (client.remember_gpu_attach), so the next gpu="auto" does not try again.
+    """
     while True:
         obj = None
         try:
@@ -253,13 +267,25 @@ def _create_and_start(sdk, kwargs: dict, name: str):
                 obj = sdk.containers.create(**kwargs)
             with client.translated(f"start container {name!r}"):
                 obj.start()
+            if kwargs.get("device_requests") and info is not None:
+                client.remember_gpu_attach(info, worked=True)
             return obj
         except LifecycleError as e:
             if obj is not None:
                 _discard(obj)   # never started: nothing to diagnose, and it would block the name
             if kwargs.get("init") and _missing_init(e):
                 kwargs = {**kwargs, "init": False}
+                if notes is not None:
+                    notes.append("this engine has no docker-init: started without init, so a stop needs its timeout")
                 continue
+            if e.code == "gpu_unavailable" and kwargs.get("device_requests"):
+                if info is not None:
+                    client.remember_gpu_attach(info, worked=False, detail=e.message)
+                if gpu_optional:
+                    kwargs = {k: v for k, v in kwargs.items() if k != "device_requests"}
+                    if notes is not None:
+                        notes.append(f"gpu='auto': Docker reports a GPU but could not attach it, so the container has none ({e.message})")
+                    continue
             raise
 
 
@@ -268,9 +294,9 @@ def _has_healthcheck(obj) -> bool:
     return bool(test) and test != ["NONE"]
 
 
-def _finish(name: str, image, action: str, timeout: float) -> ProvisionResult:
+def _finish(name: str, image, action: str, timeout: float, notes: list[str] | None = None) -> ProvisionResult:
     """Waits for readiness and, if the container is not usable, adds the diagnosis."""
-    result = ProvisionResult(status=wait_ready(name, timeout=timeout), image=image, action=action)
+    result = ProvisionResult(status=wait_ready(name, timeout=timeout), image=image, action=action, notes=list(notes or []))
     if not result.ok:
         try:
             result.diagnosis = diagnose(name)
@@ -316,11 +342,17 @@ def provision(spec: ContainerSpec, replace: bool = False, ready_timeout: float |
 
     with client.translated("read the daemon info"):
         info = sdk.info()
+    notes: list[str] = []
     use_gpu = spec.gpu == "all" or (spec.gpu == "auto" and client.gpu_available(info))
+    if spec.gpu == "auto" and not use_gpu and client.gpu_claimed(info):
+        notes.append(
+            "gpu='auto': started without a GPU, because this Docker daemon could not attach one before "
+            f"(remembered for {client.GPU_STATE_TTL // 86400} days; delete {client.gpu_state_path()} to try again)"
+        )
 
     name = spec.name or generate_name(image.tag)
     kwargs = build_create_kwargs(spec, image.tag, name, use_gpu, default_memory(info))
-    fingerprint = spec_fingerprint(kwargs, image.id)
+    fingerprint = spec_fingerprint(kwargs, image.id, spec.gpu)
     kwargs["labels"][LABEL_SPEC] = fingerprint
 
     action = "created"
@@ -350,6 +382,6 @@ def provision(spec: ContainerSpec, replace: bool = False, ready_timeout: float |
             existing.remove(force=True, v=True)
         action = "replaced"
 
-    obj = _create_and_start(sdk, kwargs, name)
+    obj = _create_and_start(sdk, kwargs, name, gpu_optional=spec.gpu == "auto", notes=notes, info=info)
     timeout = ready_timeout or (HEALTHCHECK_READY_TIMEOUT if _has_healthcheck(obj) else READY_TIMEOUT)
-    return _finish(name, image, action, timeout)
+    return _finish(name, image, action, timeout, notes)

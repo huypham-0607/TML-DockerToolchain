@@ -63,7 +63,7 @@ _UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
 LOG_RULES: list[tuple[str, str, re.Pattern, str]] = [
     (
         "gpu_unavailable", "lifecycle",
-        re.compile(r"could not select device driver|nvidia-container-cli|failed to discover GPU vendor", re.I),
+        client.GPU_UNAVAILABLE_RE,
         "this daemon cannot give the container a GPU: provision again with gpu='none'",
     ),
     (
@@ -161,13 +161,21 @@ def _evidence(line: str) -> str:
     return line.strip()[:MAX_EVIDENCE_CHARS]
 
 
-def _cuda_hint(line: str, has_gpu: bool) -> Hint:
+def _cuda_hint(line: str, has_gpu: bool, host_gpu: bool | None = None) -> Hint:
+    """The CUDA hint. Who acts depends on the container's GPU and on whether this host has one for containers."""
     if re.search(r"not compiled with CUDA", line, re.I):
         owner, text = "dockerization", "the framework in the image is a CPU-only build: install the CUDA build, then rebuild"
     elif has_gpu:
         owner, text = "dockerization", (
             "the container has a GPU but the CUDA libraries of the image do not work with it: "
             "use a base image that matches the framework's CUDA version"
+        )
+    elif host_gpu is True:
+        owner, text = "lifecycle", "the code asked for CUDA but the container has no GPU: provision again with gpu='all'"
+    elif host_gpu is False:
+        owner, text = "host", (
+            "the code needs CUDA, and Docker on this machine cannot give a container a GPU: run it on a GPU host. "
+            "To run it here, the code needs a CPU fallback (it hardcodes CUDA)"
         )
     else:
         owner, text = "lifecycle", (
@@ -177,7 +185,7 @@ def _cuda_hint(line: str, has_gpu: bool) -> Hint:
     return Hint(code="cuda_runtime", evidence=_evidence(line), suggestion=text, owner=owner)
 
 
-def _scan(status: ContainerStatus, logs: ContainerLogs | None) -> dict[str, Hint]:
+def _scan(status: ContainerStatus, logs: ContainerLogs | None, host_gpu: bool | None = None) -> dict[str, Hint]:
     """Runs LOG_RULES over the start error and the logs. Returns code -> Hint, in rule order."""
     # the last matching line counts: in a traceback the final line names the error
     lines = [status.error] if status.error else []
@@ -193,14 +201,14 @@ def _scan(status: ContainerStatus, logs: ContainerLogs | None) -> dict[str, Hint
                 continue
             used.add(i)
             if code == "cuda_runtime":
-                found[code] = _cuda_hint(lines[i], has_gpu)
+                found[code] = _cuda_hint(lines[i], has_gpu, host_gpu)
             else:
                 found[code] = Hint(code=code, evidence=_evidence(lines[i]), suggestion=suggestion, owner=owner)
             break
     return found
 
 
-def classify_failure(status: ContainerStatus, logs: ContainerLogs | None = None) -> list[Hint]:
+def classify_failure(status: ContainerStatus, logs: ContainerLogs | None = None, host_gpu: bool | None = None) -> list[Hint]:
     """Returns the known failure patterns that the status and the logs show. No Docker calls.
 
     Hints from the container state (exit code, OOM, health) come first, then the ones
@@ -209,8 +217,9 @@ def classify_failure(status: ContainerStatus, logs: ContainerLogs | None = None)
     Args:
         status: status of the container.
         logs: its logs; None looks at the status only.
+        host_gpu: whether Docker on this machine can give a container a GPU; None if unknown.
     """
-    found = _scan(status, logs)
+    found = _scan(status, logs, host_gpu)
     hints: list[Hint] = []
     mode = status.handle.mode if status.handle else ""
     code = status.exit_code
@@ -500,5 +509,17 @@ def diagnose(container: str, tail: int = DIAGNOSIS_TAIL) -> Diagnosis:
         # the daemon's oom event is proof even when the state flag was not set (yet)
         status.oom_killed = True
         status.health, status.reason = "failed", f"killed by the kernel: out of memory (exit code {status.exit_code})"
-    diagnosis.hints = classify_failure(status, logs)
+    host_gpu = best_effort("GPU availability", client.gpu_available)
+    diagnosis.hints = classify_failure(status, logs, host_gpu)
+    if (
+        host_gpu and status.handle is not None
+        and any(h.code == "cuda_runtime" and h.owner == "lifecycle" for h in diagnosis.hints)
+        and not best_effort("GPU history", lambda: client.gpu_attach_known(client.get_client().info()))
+    ):
+        # The hint would send the agent to gpu='all', but nothing has tried a GPU on this daemon yet,
+        # and a listed GPU does not have to work (Docker Desktop lists one without NVIDIA hardware).
+        # Try it once now, from the same image, so the hint is right the first time.
+        image = status.handle.image or status.handle.image_id
+        if best_effort("GPU probe", lambda: client.probe_gpu_attach(image)) is False:
+            diagnosis.hints = classify_failure(status, logs, False)
     return diagnosis

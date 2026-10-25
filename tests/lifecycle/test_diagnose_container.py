@@ -1,5 +1,8 @@
 import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 
 import requests
@@ -44,6 +47,9 @@ class TestClassifyFailure(unittest.TestCase):
     # (log line, hint code, owner)
     LOG_CASES = [
         ("docker: Error response from daemon: could not select device driver \"\" with capabilities: [[gpu]].", "gpu_unavailable", "lifecycle"),
+        ("nvidia-container-cli: initialization error: nvml error: driver not loaded: unknown", "gpu_unavailable", "lifecycle"),
+        ("Error response from daemon: unresolvable CDI devices nvidia.com/gpu=all", "gpu_unavailable", "lifecycle"),
+        ("nvidia-container-cli: initialization error: WSL environment detected but no adapters were found: unknown", "gpu_unavailable", "lifecycle"),
         ("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB (GPU 0; 10.76 GiB total capacity)", "cuda_out_of_memory", "execution"),
         ("ImportError: libGL.so.1: cannot open shared object file: No such file or directory", "missing_shared_library", "dockerization"),
         ("python: error while loading shared libraries: libpython3.8.so.1.0: cannot open shared object file", "missing_shared_library", "dockerization"),
@@ -109,6 +115,27 @@ class TestClassifyFailure(unittest.TestCase):
         self.assertEqual((hint.code, hint.owner), ("cuda_runtime", "lifecycle"))
         self.assertIn("gpu='all'", hint.suggestion)
         self.assertIn("hardcodes CUDA", hint.suggestion)          # the IPmix case from the README
+
+    def test_cuda_when_this_host_has_a_gpu_for_containers(self):
+        (hint,) = classify_failure(status(gpu=False), logs(stderr="RuntimeError: Found no NVIDIA driver on your system."), host_gpu=True)
+        self.assertEqual((hint.code, hint.owner), ("cuda_runtime", "lifecycle"))
+        self.assertIn("gpu='all'", hint.suggestion)
+
+    def test_cuda_when_this_host_has_no_gpu_for_containers(self):
+        (hint,) = classify_failure(status(gpu=False), logs(stderr="RuntimeError: Found no NVIDIA driver on your system."), host_gpu=False)
+        self.assertEqual((hint.code, hint.owner), ("cuda_runtime", "host"))     # nothing the agent can start differently
+        self.assertNotIn("gpu='all'", hint.suggestion)
+        self.assertIn("CPU fallback", hint.suggestion)
+
+    def test_container_with_a_gpu_ignores_the_host_answer(self):
+        for host_gpu in (None, True, False):
+            (hint,) = classify_failure(status(gpu=True), logs(stderr="RuntimeError: Found no NVIDIA driver on your system."), host_gpu=host_gpu)
+            self.assertEqual(hint.owner, "dockerization")
+
+    def test_cpu_only_build_ignores_the_host_answer(self):
+        for host_gpu in (None, True, False):
+            (hint,) = classify_failure(status(), logs(stderr="AssertionError: Torch not compiled with CUDA enabled"), host_gpu=host_gpu)
+            self.assertEqual(hint.owner, "dockerization")
 
     def test_cuda_with_a_gpu_in_the_container(self):
         (hint,) = classify_failure(status(gpu=True), logs(stderr="RuntimeError: Found no NVIDIA driver on your system."))
@@ -408,6 +435,71 @@ class TestDiagnoseLogic(unittest.TestCase):
         d = diagnose("tml-demo")
         self.assertFalse(d.status.oom_killed)
         self.assertEqual([h.code for h in d.hints], ["sigkill"])
+
+    CUDA = "RuntimeError: Found no NVIDIA driver on your system.\n"
+
+    def cuda_failure(self, info: dict) -> None:
+        container = FakeContainer(make_attrs(status="exited", exit_code=1))
+        container.stderr_log = self.CUDA.encode()
+        use_fake(self, FakeClient(container, info=info))
+
+    def probe_answers(self, worked) -> mock.Mock:
+        patcher = mock.patch.object(diagnostics.client, "probe_gpu_attach", side_effect=[worked] if not isinstance(worked, Exception) else worked)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def test_cuda_hint_on_a_host_without_a_gpu(self):
+        self.cuda_failure({"Runtimes": {"runc": {}}})
+        probe = self.probe_answers(True)
+        self.assertEqual([(h.code, h.owner) for h in diagnose("tml-demo").hints], [("cuda_runtime", "host")])
+        probe.assert_not_called()                                    # nothing listed: nothing to try
+
+    def test_listed_gpu_that_does_not_work(self):
+        # Docker Desktop without NVIDIA hardware: the runtime is listed, the probe shows that it does not work
+        self.cuda_failure({"ID": "d1", "Runtimes": {"nvidia": {}}})
+        probe = self.probe_answers(False)
+        (hint,) = diagnose("tml-demo").hints
+        self.assertEqual((hint.code, hint.owner), ("cuda_runtime", "host"))
+        self.assertNotIn("gpu='all'", hint.suggestion)
+        probe.assert_called_once_with("demo:latest")                # the container's own image: nothing is pulled
+
+    def test_listed_gpu_that_works(self):
+        self.cuda_failure({"ID": "d1", "Runtimes": {"nvidia": {}}})
+        self.probe_answers(True)
+        (hint,) = diagnose("tml-demo").hints
+        self.assertEqual((hint.owner, "gpu='all'" in hint.suggestion), ("lifecycle", True))
+
+    def test_known_gpu_history_is_not_probed_again(self):
+        info = {"ID": "d1", "Runtimes": {"nvidia": {}}}
+        self.cuda_failure(info)
+        with mock.patch.dict(os.environ, {"TML_CACHE_DIR": self.cache_dir()}):
+            diagnostics.client.remember_gpu_attach(info, worked=True)
+            probe = self.probe_answers(False)
+            self.assertEqual(diagnose("tml-demo").hints[0].owner, "lifecycle")
+            probe.assert_not_called()
+            diagnostics.client.remember_gpu_attach(info, worked=False)
+            self.assertEqual(diagnose("tml-demo").hints[0].owner, "host")
+            probe.assert_not_called()
+
+    def test_probe_that_cannot_run_leaves_the_hint_and_a_note(self):
+        self.cuda_failure({"ID": "d1", "Runtimes": {"nvidia": {}}})
+        self.probe_answers(LifecycleError("image_not_found", "image is gone"))
+        d = diagnose("tml-demo")
+        self.assertEqual(d.hints[0].owner, "lifecycle")
+        self.assertTrue(any(n.startswith("GPU probe not available") for n in d.notes))
+
+    def test_no_probe_without_a_cuda_failure(self):
+        container = FakeContainer(make_attrs(status="exited", exit_code=3))
+        container.stderr_log = b"boom\n"
+        use_fake(self, FakeClient(container, info={"ID": "d1", "Runtimes": {"nvidia": {}}}))
+        probe = self.probe_answers(False)
+        diagnose("tml-demo")
+        probe.assert_not_called()
+
+    def cache_dir(self) -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return tmp.name
 
     def test_events_are_asked_by_the_daemon_clock(self):
         container, fake = self.one(status="exited", exit_code=3, created="2026-10-09T10:00:00.123456789Z")

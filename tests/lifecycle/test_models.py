@@ -159,7 +159,8 @@ class TestProvisionResult(unittest.TestCase):
 
     def test_to_dict(self):
         data = json.loads(self.result("idle", "running", "healthy").to_json())
-        self.assertEqual(set(data), {"ok", "action", "image", "status", "diagnosis"})
+        self.assertEqual(set(data), {"ok", "action", "image", "status", "diagnosis", "notes"})
+        self.assertEqual(data["notes"], [])
         self.assertIs(data["ok"], True)
         self.assertEqual(data["action"], "created")
         self.assertEqual(data["image"], {"id": "51dafde81dbd", "tag": "demo:1", "built": False, "builder": ""})

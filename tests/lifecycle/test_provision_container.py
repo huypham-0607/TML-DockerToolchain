@@ -235,11 +235,14 @@ class TestFingerprintAndNames(unittest.TestCase):
         for changed in ({"memory": "1g"}, {"mode": "native"}, {"env": {"A": "1"}}, {"ports": ["80"]}, {"cpus": 2}, {"network": "none"}):
             self.assertNotEqual(base, spec_fingerprint(self.kwargs(**changed), "abc"), changed)
 
-    def test_gpu_counts(self):
+    def test_gpu_option_counts_not_the_resolved_request(self):
         spec = ContainerSpec(image="demo:1")
         without = build_create_kwargs(spec, "demo:1", "n", use_gpu=False)
         with_gpu = build_create_kwargs(spec, "demo:1", "n", use_gpu=True)
-        self.assertNotEqual(spec_fingerprint(without, "abc"), spec_fingerprint(with_gpu, "abc"))
+        # gpu="auto" with and without a working GPU: the same container, so it can be reused
+        self.assertEqual(spec_fingerprint(without, "abc", "auto"), spec_fingerprint(with_gpu, "abc", "auto"))
+        self.assertNotEqual(spec_fingerprint(without, "abc", "none"), spec_fingerprint(with_gpu, "abc", "all"))
+        self.assertNotEqual(spec_fingerprint(without, "abc", "auto"), spec_fingerprint(without, "abc", "none"))
 
     def test_generated_names(self):
         self.assertRegex(generate_name("tml-local/robust-training:3d51101d19ac"), r"^tml-robust-training-[0-9a-f]{6}$")
@@ -561,10 +564,15 @@ class TestOptions(LiveCase):
     def test_gpu_none(self):
         self.assertFalse(samples.start("idle", "opt-gpu-none", gpu="none").handle.gpu)
 
-    def test_gpu_auto_follows_the_daemon(self):
+    def test_gpu_auto_never_fails_for_want_of_a_gpu(self):
         r = samples.start("idle", "opt-gpu-auto", gpu="auto")
-        self.assertTrue(r.ok)
-        self.assertEqual(r.handle.gpu, client.gpu_available())
+        self.assertTrue(r.ok)                                        # with or without a GPU, the container runs
+        if not client.gpu_claimed():
+            self.assertFalse(r.handle.gpu)
+            self.assertEqual(r.notes, [])                            # nothing was listed, nothing to report
+        elif not r.handle.gpu:
+            # Docker lists a GPU that did not work, now or earlier in this run: the note says so
+            self.assertTrue(any("gpu='auto'" in note for note in r.notes))
 
     def test_gpu_all(self):
         # with a GPU: the container gets it. Without one: a clear error and no leftover container.
@@ -639,6 +647,70 @@ class TestCreateAndStart(unittest.TestCase):
         self.assertTrue(obj.kwargs["init"])
         obj.remove.assert_not_called()
 
+    NO_GPU = LifecycleError("gpu_unavailable", "could not start container 'tml-x': nvidia-container-cli: initialization error: nvml error: driver not loaded")
+    GPU_KWARGS = {"name": "tml-x", "init": True, "device_requests": [{"Count": -1, "Capabilities": [["gpu"]]}]}
+
+    def test_optional_gpu_that_cannot_be_attached(self):
+        sdk = self.sdk(self.NO_GPU, None)
+        notes: list[str] = []
+        obj = provision_module._create_and_start(sdk, dict(self.GPU_KWARGS), "tml-x", gpu_optional=True, notes=notes)
+        self.assertIs(obj, sdk.created[1])
+        self.assertNotIn("device_requests", obj.kwargs)
+        self.assertTrue(obj.kwargs["init"])                                   # nothing else changed
+        sdk.created[0].remove.assert_called_once_with(force=True, v=True)
+        (note,) = notes
+        self.assertIn("gpu='auto'", note)
+        self.assertIn("nvml error", note)
+
+    def test_required_gpu_that_cannot_be_attached(self):
+        sdk = self.sdk(self.NO_GPU)
+        with self.assertRaises(LifecycleError) as ctx:
+            provision_module._create_and_start(sdk, dict(self.GPU_KWARGS), "tml-x", gpu_optional=False)
+        self.assertEqual(ctx.exception.code, "gpu_unavailable")
+        self.assertEqual(len(sdk.created), 1)
+
+    def test_gpu_error_without_a_gpu_request_is_raised(self):
+        sdk = self.sdk(self.NO_GPU)
+        with self.assertRaises(LifecycleError):
+            provision_module._create_and_start(sdk, {"name": "tml-x", "init": True}, "tml-x", gpu_optional=True)
+        self.assertEqual(len(sdk.created), 1)
+
+    def test_no_docker_init_and_no_gpu(self):
+        sdk = self.sdk(self.NO_INIT, self.NO_GPU, None)
+        notes: list[str] = []
+        obj = provision_module._create_and_start(sdk, dict(self.GPU_KWARGS), "tml-x", gpu_optional=True, notes=notes)
+        self.assertEqual(len(sdk.created), 3)
+        self.assertEqual((obj.kwargs["init"], "device_requests" in obj.kwargs), (False, False))
+        self.assertEqual(len(notes), 2)
+
+    INFO = {"ID": "daemon-1", "Runtimes": {"nvidia": {}}}
+
+    def remembered(self) -> mock.Mock:
+        patcher = mock.patch.object(provision_module.client, "remember_gpu_attach")
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def test_failed_optional_gpu_is_remembered(self):
+        remember = self.remembered()
+        provision_module._create_and_start(self.sdk(self.NO_GPU, None), dict(self.GPU_KWARGS), "tml-x", gpu_optional=True, info=self.INFO)
+        remember.assert_called_once_with(self.INFO, worked=False, detail=self.NO_GPU.message)
+
+    def test_failed_required_gpu_is_remembered(self):
+        remember = self.remembered()
+        with self.assertRaises(LifecycleError):
+            provision_module._create_and_start(self.sdk(self.NO_GPU), dict(self.GPU_KWARGS), "tml-x", info=self.INFO)
+        remember.assert_called_once_with(self.INFO, worked=False, detail=self.NO_GPU.message)
+
+    def test_working_gpu_is_remembered(self):
+        remember = self.remembered()
+        provision_module._create_and_start(self.sdk(None), dict(self.GPU_KWARGS), "tml-x", gpu_optional=True, info=self.INFO)
+        remember.assert_called_once_with(self.INFO, worked=True)
+
+    def test_nothing_is_remembered_without_a_gpu_request(self):
+        remember = self.remembered()
+        provision_module._create_and_start(self.sdk(None), {"name": "tml-x", "init": True}, "tml-x", info=self.INFO)
+        remember.assert_not_called()
+
     def test_engine_without_docker_init(self):
         sdk = self.sdk(self.NO_INIT, None)
         kwargs = {"name": "tml-x", "init": True}
@@ -668,6 +740,59 @@ class TestCreateAndStart(unittest.TestCase):
         sdk.containers.create.side_effect = LifecycleError("docker_error", "invalid mount config")
         with self.assertRaises(LifecycleError):
             provision_module._create_and_start(sdk, {"name": "tml-x", "init": True}, "tml-x")
+
+
+class TestGpuChoice(unittest.TestCase):
+    """How provision turns the gpu option into a GPU request (Docker calls replaced by mocks)."""
+
+    def provision_with(self, gpu: str, daemon_has_gpu: bool) -> dict:
+        info = {"Runtimes": {"nvidia": {}} if daemon_has_gpu else {"runc": {}}, "MemTotal": 16 * GB}
+        use_fake(self, FakeClient(images=[FakeImage("demo:1")], info=info))
+        calls = {}
+
+        def create_and_start(sdk, kwargs, name, gpu_optional=False, notes=None, info=None):
+            calls.update(kwargs=kwargs, gpu_optional=gpu_optional, notes=list(notes or []), info=info)
+            return mock.Mock(attrs={"Config": {}})
+
+        with mock.patch.object(provision_module, "_create_and_start", side_effect=create_and_start), \
+                mock.patch.object(provision_module, "_finish", return_value="done"):
+            provision(ContainerSpec(image="demo:1", name="tml-x", gpu=gpu))
+        return calls
+
+    def test_remembered_failure_skips_the_gpu_and_says_so(self):
+        failed = mock.patch.object(provision_module.client, "gpu_attach_failed", return_value=True)
+        failed.start()
+        self.addCleanup(failed.stop)
+        calls = self.provision_with("auto", daemon_has_gpu=True)
+        self.assertNotIn("device_requests", calls["kwargs"])          # no failed attempt on every start
+        (note,) = calls["notes"]
+        self.assertIn("could not attach one before", note)
+        self.assertIn(client.GPU_STATE_FILE, note)                   # how to try again
+        calls = self.provision_with("all", daemon_has_gpu=True)
+        self.assertIn("device_requests", calls["kwargs"])            # "all" still insists
+
+    def test_daemon_info_reaches_the_start(self):
+        calls = self.provision_with("auto", daemon_has_gpu=True)
+        self.assertIn("nvidia", calls["info"]["Runtimes"])
+
+    def test_auto_with_a_gpu_asks_for_it_but_may_do_without(self):
+        calls = self.provision_with("auto", daemon_has_gpu=True)
+        self.assertIn("device_requests", calls["kwargs"])
+        self.assertTrue(calls["gpu_optional"])
+
+    def test_auto_without_a_gpu_asks_for_none(self):
+        calls = self.provision_with("auto", daemon_has_gpu=False)
+        self.assertNotIn("device_requests", calls["kwargs"])
+
+    def test_all_insists(self):
+        for daemon_has_gpu in (True, False):
+            calls = self.provision_with("all", daemon_has_gpu)
+            self.assertIn("device_requests", calls["kwargs"])
+            self.assertFalse(calls["gpu_optional"])
+
+    def test_none_never_asks(self):
+        calls = self.provision_with("none", daemon_has_gpu=True)
+        self.assertNotIn("device_requests", calls["kwargs"])
 
 
 class TestFinish(unittest.TestCase):
@@ -731,7 +856,14 @@ class TestFinish(unittest.TestCase):
 
     def test_result_keeps_image_and_action(self):
         result, _ = self.finish("healthy")
-        self.assertEqual((result.image, result.action), (self.IMAGE, "created"))
+        self.assertEqual((result.image, result.action, result.notes), (self.IMAGE, "created", []))
+
+    def test_notes_are_passed_on(self):
+        wait = mock.patch.object(provision_module, "wait_ready", return_value=ContainerStatus("tml-demo", "running", "healthy"))
+        wait.start()
+        self.addCleanup(wait.stop)
+        result = provision_module._finish("tml-demo", self.IMAGE, "created", 5, ["started without a GPU"])
+        self.assertEqual(result.notes, ["started without a GPU"])
 
 
 @requires_docker
