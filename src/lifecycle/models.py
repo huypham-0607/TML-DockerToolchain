@@ -191,6 +191,7 @@ class ProvisionResult(_Serializable):
     image: ImageRef
     action: str                # created | replaced | reused | restarted
     diagnosis: Diagnosis | None = None     # filled when the container did not become usable
+    notes: list[str] = field(default_factory=list)   # what provision had to change, e.g. started without a GPU
 
     @property
     def handle(self) -> ContainerHandle | None:
@@ -209,6 +210,7 @@ class ProvisionResult(_Serializable):
             "image": self.image.to_dict(),
             "status": self.status.to_dict(),
             "diagnosis": self.diagnosis.to_dict() if self.diagnosis else None,
+            "notes": list(self.notes),
         }
 
 

@@ -128,7 +128,11 @@ def container_name(suffix: str) -> str:
 
 
 def spec(sample: str, suffix: str, **fields) -> ContainerSpec:
-    """A ContainerSpec for the sample, named and labelled for this test run."""
+    """A ContainerSpec for the sample, named and labelled for this test run.
+
+    No GPU unless a test asks for one (gpu=...): the same results with and without a GPU on the host.
+    """
+    fields.setdefault("gpu", "none")
     fields.setdefault("labels", {})
     fields["labels"] = {**fields["labels"], **TEST_LABEL}
     return ContainerSpec(dockerfile=dockerfile(sample), name=container_name(suffix), **fields)

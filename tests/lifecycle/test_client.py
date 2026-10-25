@@ -59,6 +59,23 @@ class TestTranslate(unittest.TestCase):
         self.assertEqual(err.code, "invalid_argument")
         self.assertIn("File Sharing", err.hint)
 
+    def test_gpu_unavailable_other_wordings(self):
+        for text in (
+            "failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: "
+            "unable to start container process: error during container init: error running prestart hook #0: exit status 1, "
+            "stdout: , stderr: Auto-detected mode as 'legacy'\nnvidia-container-cli: initialization error: nvml error: driver not loaded",
+            "could not start container: unresolvable CDI devices nvidia.com/gpu=all",
+            "failed to inject CDI devices: unresolvable CDI devices nvidia.com/gpu=0",
+        ):
+            err = client.translate(api_error(500, text))
+            self.assertEqual(err.code, "gpu_unavailable", text)
+            self.assertIn("gpu='none'", err.hint)
+
+    def test_cuda_error_inside_a_container_is_not_a_daemon_gpu_error(self):
+        # these come from the code in the container (its logs), not from the daemon
+        for text in ("RuntimeError: Found no NVIDIA driver on your system.", "CUDA error: no kernel image is available"):
+            self.assertIsNone(client.GPU_UNAVAILABLE_RE.search(text), text)
+
     def test_port_conflict(self):
         exc = api_error(500, "driver failed programming external connectivity: Bind for 0.0.0.0:8888 failed: port is already allocated")
         self.assertEqual(self.code(exc), "port_conflict")

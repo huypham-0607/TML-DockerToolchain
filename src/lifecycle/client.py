@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 from contextlib import contextmanager
 
 import docker
@@ -21,6 +22,14 @@ from .models import LifecycleError
 
 # Seconds to wait for one daemon request
 DEFAULT_TIMEOUT = 30
+
+# How a daemon says that it cannot give a container a GPU: no NVIDIA runtime (engines before 28),
+# a toolkit without a working driver, or no / stale CDI devices (newer engines)
+GPU_UNAVAILABLE_RE = re.compile(
+    r"could not select device driver|nvidia-container-cli|nvml error|failed to discover GPU vendor"
+    r"|unresolvable CDI devices|failed to inject CDI devices",
+    re.I,
+)
 
 # The daemon socket of a rootful engine is open to root and the docker group only
 SOCKET_PERMISSION_HINT = (
@@ -104,8 +113,7 @@ def translate(exc: BaseException, what: str = "") -> LifecycleError:
     if isinstance(exc, docker_errors.NotFound):
         return err("not_found", "list the managed containers with container_status()")
     if isinstance(exc, docker_errors.APIError):
-        # Engine < 28 / NVIDIA runtime wording, then the CDI wording of newer engines
-        if "could not select device driver" in low or "nvidia-container-cli" in low or "gpu vendor" in low:
+        if GPU_UNAVAILABLE_RE.search(detail):
             return err("gpu_unavailable", "this daemon cannot give the container a GPU; provision again with gpu='none'")
         if "mounts denied" in low:
             return err(

@@ -44,6 +44,8 @@ class TestClassifyFailure(unittest.TestCase):
     # (log line, hint code, owner)
     LOG_CASES = [
         ("docker: Error response from daemon: could not select device driver \"\" with capabilities: [[gpu]].", "gpu_unavailable", "lifecycle"),
+        ("nvidia-container-cli: initialization error: nvml error: driver not loaded: unknown", "gpu_unavailable", "lifecycle"),
+        ("Error response from daemon: unresolvable CDI devices nvidia.com/gpu=all", "gpu_unavailable", "lifecycle"),
         ("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB (GPU 0; 10.76 GiB total capacity)", "cuda_out_of_memory", "execution"),
         ("ImportError: libGL.so.1: cannot open shared object file: No such file or directory", "missing_shared_library", "dockerization"),
         ("python: error while loading shared libraries: libpython3.8.so.1.0: cannot open shared object file", "missing_shared_library", "dockerization"),
@@ -109,6 +111,27 @@ class TestClassifyFailure(unittest.TestCase):
         self.assertEqual((hint.code, hint.owner), ("cuda_runtime", "lifecycle"))
         self.assertIn("gpu='all'", hint.suggestion)
         self.assertIn("hardcodes CUDA", hint.suggestion)          # the IPmix case from the README
+
+    def test_cuda_when_this_host_has_a_gpu_for_containers(self):
+        (hint,) = classify_failure(status(gpu=False), logs(stderr="RuntimeError: Found no NVIDIA driver on your system."), host_gpu=True)
+        self.assertEqual((hint.code, hint.owner), ("cuda_runtime", "lifecycle"))
+        self.assertIn("gpu='all'", hint.suggestion)
+
+    def test_cuda_when_this_host_has_no_gpu_for_containers(self):
+        (hint,) = classify_failure(status(gpu=False), logs(stderr="RuntimeError: Found no NVIDIA driver on your system."), host_gpu=False)
+        self.assertEqual((hint.code, hint.owner), ("cuda_runtime", "host"))     # nothing the agent can start differently
+        self.assertNotIn("gpu='all'", hint.suggestion)
+        self.assertIn("CPU fallback", hint.suggestion)
+
+    def test_container_with_a_gpu_ignores_the_host_answer(self):
+        for host_gpu in (None, True, False):
+            (hint,) = classify_failure(status(gpu=True), logs(stderr="RuntimeError: Found no NVIDIA driver on your system."), host_gpu=host_gpu)
+            self.assertEqual(hint.owner, "dockerization")
+
+    def test_cpu_only_build_ignores_the_host_answer(self):
+        for host_gpu in (None, True, False):
+            (hint,) = classify_failure(status(), logs(stderr="AssertionError: Torch not compiled with CUDA enabled"), host_gpu=host_gpu)
+            self.assertEqual(hint.owner, "dockerization")
 
     def test_cuda_with_a_gpu_in_the_container(self):
         (hint,) = classify_failure(status(gpu=True), logs(stderr="RuntimeError: Found no NVIDIA driver on your system."))
@@ -408,6 +431,14 @@ class TestDiagnoseLogic(unittest.TestCase):
         d = diagnose("tml-demo")
         self.assertFalse(d.status.oom_killed)
         self.assertEqual([h.code for h in d.hints], ["sigkill"])
+
+    def test_cuda_hint_follows_this_host(self):
+        cuda = "RuntimeError: Found no NVIDIA driver on your system.\n"
+        for info, owner in (({"Runtimes": {"runc": {}}}, "host"), ({"Runtimes": {"nvidia": {}}}, "lifecycle")):
+            container = FakeContainer(make_attrs(status="exited", exit_code=1))
+            container.stderr_log = cuda.encode()
+            use_fake(self, FakeClient(container, info=info))
+            self.assertEqual([(h.code, h.owner) for h in diagnose("tml-demo").hints], [("cuda_runtime", owner)])
 
     def test_events_are_asked_by_the_daemon_clock(self):
         container, fake = self.one(status="exited", exit_code=3, created="2026-10-09T10:00:00.123456789Z")

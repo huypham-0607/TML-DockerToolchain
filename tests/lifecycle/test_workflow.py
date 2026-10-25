@@ -183,6 +183,11 @@ class TestEnvelopes(unittest.TestCase):
         self.assertEqual(data["image"], {"id": "51dafde81dbd", "tag": "tml-local/demo:abc", "built": True})
         self.assertEqual(data["status"]["handle"]["name"], "tml-demo")
 
+    def test_provision_notes_reach_the_llm(self):
+        result = ProvisionResult(status=status(), image=self.IMAGE, action="created", notes=["gpu='auto': started without a GPU"])
+        data, _, _ = self.provision_reply(result, image="demo:1")
+        self.assertEqual(data["notes"], ["gpu='auto': started without a GPU"])
+
     def test_provision_failure_carries_the_diagnosis(self):
         failed = status(state="exited", health="failed", exit_code=1)
         diagnosis = Diagnosis(

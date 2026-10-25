@@ -243,9 +243,14 @@ def _missing_init(error: LifecycleError) -> bool:
     return "docker-init" in error.message.lower()
 
 
-def _create_and_start(sdk, kwargs: dict, name: str):
-    """Creates and starts the container. Without docker-init on this engine, it tries once more
-    without init: the container works, but a stop then needs its timeout and SIGKILL."""
+def _create_and_start(sdk, kwargs: dict, name: str, gpu_optional: bool = False, notes: list[str] | None = None):
+    """Creates and starts the container, and tries once more when something optional is missing:
+
+      - no docker-init on this engine: without init (it works, but a stop then needs its timeout)
+      - gpu_optional (gpu="auto") and the GPU cannot be attached: without a GPU
+
+    What it had to leave out is added to `notes`.
+    """
     while True:
         obj = None
         try:
@@ -259,6 +264,13 @@ def _create_and_start(sdk, kwargs: dict, name: str):
                 _discard(obj)   # never started: nothing to diagnose, and it would block the name
             if kwargs.get("init") and _missing_init(e):
                 kwargs = {**kwargs, "init": False}
+                if notes is not None:
+                    notes.append("this engine has no docker-init: started without init, so a stop needs its timeout")
+                continue
+            if gpu_optional and e.code == "gpu_unavailable" and kwargs.get("device_requests"):
+                kwargs = {k: v for k, v in kwargs.items() if k != "device_requests"}
+                if notes is not None:
+                    notes.append(f"gpu='auto': Docker reports a GPU but could not attach it, so the container has none ({e.message})")
                 continue
             raise
 
@@ -268,9 +280,9 @@ def _has_healthcheck(obj) -> bool:
     return bool(test) and test != ["NONE"]
 
 
-def _finish(name: str, image, action: str, timeout: float) -> ProvisionResult:
+def _finish(name: str, image, action: str, timeout: float, notes: list[str] | None = None) -> ProvisionResult:
     """Waits for readiness and, if the container is not usable, adds the diagnosis."""
-    result = ProvisionResult(status=wait_ready(name, timeout=timeout), image=image, action=action)
+    result = ProvisionResult(status=wait_ready(name, timeout=timeout), image=image, action=action, notes=list(notes or []))
     if not result.ok:
         try:
             result.diagnosis = diagnose(name)
@@ -350,6 +362,7 @@ def provision(spec: ContainerSpec, replace: bool = False, ready_timeout: float |
             existing.remove(force=True, v=True)
         action = "replaced"
 
-    obj = _create_and_start(sdk, kwargs, name)
+    notes: list[str] = []
+    obj = _create_and_start(sdk, kwargs, name, gpu_optional=spec.gpu == "auto", notes=notes)
     timeout = ready_timeout or (HEALTHCHECK_READY_TIMEOUT if _has_healthcheck(obj) else READY_TIMEOUT)
-    return _finish(name, image, action, timeout)
+    return _finish(name, image, action, timeout, notes)
