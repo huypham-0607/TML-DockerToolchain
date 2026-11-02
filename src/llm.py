@@ -46,7 +46,7 @@ def make_model(provider: str | None = None, model: str | None = None):
         raise RuntimeError(f"{cfg['api_key_env']} is not set (needed for LLM_PROVIDER={provider}); add it to .env")
 
     rate_limiter = InMemoryRateLimiter(
-        requests_per_second=2,   # 120/min, comfortable for Purdue GenAI
+               requests_per_second=0.3,   # 18/min: Purdue GenAI allows 20 requests per minute per user
         check_every_n_seconds=0.1,
         max_bucket_size=1,
     )
