@@ -3,4 +3,5 @@
 **/__pycache__/
 /runs
 
-local/
+local/local/
+references/.repos/
