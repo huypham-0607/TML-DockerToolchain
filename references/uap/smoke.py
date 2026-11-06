@@ -10,6 +10,14 @@ run: it loads files from the authors' machine (/home/fazhong/studio/uap/...).
 """
 import sys
 
+# The code imports itself as the package `uap` (main.py: from uap.train.model_structure import ...),
+# and train/*.py import `models` from the repo root. Say so plainly when an image lacks that layout.
+try:
+    import uap.train.model_structure  # noqa: F401
+except ModuleNotFoundError as e:
+    sys.exit(f"FAIL: {e}. UAP must be importable as the package `uap`: put the repository at <dir>/uap "
+             "and add <dir> and <dir>/uap to PYTHONPATH (the reference uses /workspace/uap)")
+
 import numpy as np
 import sklearn
 import torch
