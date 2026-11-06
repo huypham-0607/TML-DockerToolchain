@@ -117,8 +117,10 @@ def run_smoke(image: str, smoke: Path) -> tuple[bool, str]:
                                stdin=script, capture_output=True, text=True, timeout=SMOKE_TIMEOUT)
     except subprocess.TimeoutExpired:
         return False, f"timed out after {SMOKE_TIMEOUT}s"
-    tail = "\n".join((p.stdout + p.stderr).strip().splitlines()[-12:])
-    return p.returncode == 0 and "SMOKE OK" in p.stdout, tail
+    passed = p.returncode == 0 and "SMOKE OK" in p.stdout
+    # a pass: the end of the normal output; a failure: the end of the errors (the traceback)
+    text = p.stdout if passed or not p.stderr.strip() else p.stderr
+    return passed, "\n".join(text.strip().splitlines()[-12:])
 
 
 def public(version: str | None) -> str | None:
