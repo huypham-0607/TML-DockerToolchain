@@ -92,14 +92,23 @@ These problems are the things the agent has to get right, so they are also the t
 | UAP | `train/model_structure.get_model` lists about 45 networks, but most import names that the repo's `models/` package does not define. Of the 12 tested, only `resnet18` and `resnet34` build. | None (code bug). The smoke test reports which names work. |
 | UAP | ART 1.17.1 does `from pkg_resources import packaging`, which setuptools 70 and later removed, so `import art.estimators` fails. | `setuptools<70`. |
 
-## Compare against the pipeline (next step)
+## Compare against the pipeline
 
 Compare outcomes, not Dockerfile text: two different Dockerfiles can both be correct.
-For a repository, run the agent, build its Dockerfile, then check against the reference:
+`scripts/evaluate.py` does the comparison for every repository in `repos.txt`:
 
-1. Both images build.
-2. Same Python major.minor, and the same torch and torchvision versions, or versions that are compatible with each other.
-3. The same `smoke.py` passes in both images:
-   `docker run --rm -i <pipeline image> python - < references/<name>/smoke.py`
+```bash
+references/run.sh all                              # the reference images, once
+uv run python -m scripts.evaluate                  # the pipeline's template step (no LLM)
+uv run python -m scripts.evaluate --agent ffb      # the full agent on one repository
+```
 
-The smoke scripts assume the repository is at `/workspace` (`/workspace/uap` for UAP) and, for FFB, that the scripts are in `/workspace/src`.
+It checks:
+
+1. The pipeline's image builds.
+2. Python major.minor and the torch / torchvision versions match the reference image (`+cpu` / `+cuNNN` suffixes ignored).
+3. The same `smoke.py` passes in the pipeline's image, without network.
+
+Results: `runs/eval/results.md` and `runs/eval/results.json`.
+
+The smoke scripts assume the repository is at `/workspace` (`/workspace/uap` for UAP, which imports itself as the package `uap`) and, for FFB, that the scripts are in `/workspace/src`.
