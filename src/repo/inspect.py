@@ -62,6 +62,7 @@ class RepoProfile:
                 for k, v in env.resolved.items()
             },
             "frameworks": env.frameworks,
+            "third_party_imports": env.imports[:max_items],
             "gpu": {
                 "uses_cuda": env.gpu.uses_cuda,
                 "gpu_required": env.gpu.gpu_required,

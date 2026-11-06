@@ -165,3 +165,67 @@ class TestChooseBuild(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNoRequirementsFile(GenerateCase):
+    """IPMix / EP-BNP case: no dependency file, so the template used to install nothing at all."""
+
+    REPO = {
+        "train.py": "import torch, torchvision\nimport numpy as np\nfrom PIL import Image\nimport tqdm\n"
+                    "import utils\nfrom models.resnet import net\nimport os, json\n",
+        "utils.py": "import torchattacks\n",
+        "models/resnet.py": "import torch.nn as nn\n",
+    }
+
+    def test_torch_imported_but_not_pinned_is_installed(self):
+        text, _, _ = self.gen("noreq", self.REPO)
+        self.assertIn(f'{CPU_INDEX} "torch" "torchvision"', text)
+
+    def test_other_imports_are_installed_best_effort(self):
+        text, _, notes = self.gen("noreq", self.REPO)
+        line = next(x for x in text.splitlines() if x.startswith("RUN for p in"))
+        self.assertEqual(line.split(" in ")[1].split(";")[0].split(), ["Pillow", "numpy", "torchattacks", "tqdm"])
+        self.assertIn('|| echo "could not install', line)          # a wrong guess does not fail the build
+        self.assertTrue(any("guessed" in n or "from imports" in n for n in notes))
+        for local_or_stdlib in ("utils", "models", "os", "json"):
+            self.assertNotIn(f" {local_or_stdlib} ", f" {line} ")
+
+    def test_declared_packages_are_not_guessed_again(self):
+        text, _, _ = self.gen("partial", {"requirements.txt": "Pillow==9.4.0\nnumpy==1.24.2\n",
+                                          "a.py": "from PIL import Image\nimport numpy\nimport folktables\n"})
+        line = next(x for x in text.splitlines() if x.startswith("RUN for p in"))
+        self.assertEqual(line.split(" in ")[1].split(";")[0].split(), ["folktables"])   # FFB's missing package
+
+    def test_python_falls_back_to_310_not_newest(self):
+        text, _, _ = self.gen("fstring", {"a.py": "x = 1\nprint(f'{x}')\n"})      # only "needs >= 3.6"
+        self.assertIn("FROM python:3.10-slim", text)
+
+
+class TestTorchCompanions(GenerateCase):
+    def test_mismatched_torchvision_is_repinned(self):
+        # UAP: torch==2.2.0 with torchvision==0.16.0, which needs torch 2.1
+        text, _, notes = self.gen("uap", {"requirements.txt": "torch==2.2.0\ntorchvision==0.16.0\n"})
+        self.assertIn('"torch==2.2.0" "torchvision==0.17.*"', text)
+        self.assertTrue(any("torchvision==0.16.0 does not work with torch==2.2.0" in n for n in notes))
+
+    def test_matching_pair_is_kept(self):
+        text, _, notes = self.gen("ok", {"requirements.txt": "torch==1.13.1+cu116\ntorchvision==0.14.1+cu116\ntorchaudio==0.13.1\n"})
+        self.assertIn('"torch==1.13.1" "torchvision==0.14.1" "torchaudio==0.13.1"', text)
+        self.assertFalse(any("does not work with torch==" in n for n in notes))
+
+    def test_unknown_torch_version_is_left_alone(self):
+        pins, notes = generate.fix_companions(["torch==9.9.0", "torchvision==0.1.0"])
+        self.assertEqual((pins, notes), (["torch==9.9.0", "torchvision==0.1.0"], []))
+
+    def test_old_torch_gets_numpy_below_2(self):
+        text, _, notes = self.gen("old", {"requirements.txt": "torch==1.12.1\n"})
+        self.assertIn('"numpy<2"', text)
+        self.assertTrue(any("numpy<2" in n for n in notes))
+
+    def test_pinned_numpy_is_not_overridden(self):
+        text, _, _ = self.gen("oldnp", {"requirements.txt": "torch==1.12.1\nnumpy==1.21.0\n"})
+        self.assertNotIn("numpy<2", text)
+
+    def test_new_torch_keeps_numpy_free(self):
+        text, _, _ = self.gen("new", {"requirements.txt": "torch==2.4.0\n"})
+        self.assertNotIn("numpy<2", text)

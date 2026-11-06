@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+import warnings
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -35,6 +36,12 @@ FIELDS = ("python", "cuda", "cudnn", "torch", "tensorflow", "jax")
 
 # Python versions we would consider picking, newest first
 PYTHON_CANDIDATES = ["3.13", "3.12", "3.11", "3.10", "3.9", "3.8", "3.7", "3.6", "2.7"]
+
+# Picked when only lower bounds are known (for example "syntax needs Python >= 3.6"), instead of the
+# newest Python: research code
+# and its pinned packages are rarely ready for the newest Python, and 3.10 has the widest support
+# among PyTorch / TensorFlow releases.
+PYTHON_FALLBACK = "3.10"
 
 # torch major.minor -> (default CUDA of the pip wheel, min python, max python)
 TORCH_COMPAT = {
@@ -132,6 +139,7 @@ class EnvironmentReport:
     gpu: GPUUsage
     evidence: list[Evidence]
     notes: list[str] = field(default_factory=list)
+    imports: list[str] = field(default_factory=list)   # third-party top-level modules the code imports
 
     def summary(self) -> dict[str, str | None]:
         return {k: v.value for k, v in self.resolved.items()}
@@ -356,9 +364,12 @@ def _collect_code(root: Path) -> tuple[list[Evidence], set[str], GPUUsage]:
     min_py: tuple[str, str] | None = None  # (version, file)
     py2_files: list[str] = []
     unguarded: list[str] = []
+    local: set[str] = {root.name, root.name.lower()}     # modules of the repository itself: file stems and directory names
 
     for path in _iter_code_files(root):
         rel = path.relative_to(root).as_posix()
+        local.add(path.stem)
+        local.update(Path(rel).parts[:-1])
         if path.suffix in (".cu", ".cuh"):
             gpu.custom_cuda_code.append(rel)
             gpu.needs_nvcc = True
@@ -366,7 +377,9 @@ def _collect_code(root: Path) -> tuple[list[Evidence], set[str], GPUUsage]:
         text = _notebook_source(path) if path.suffix == ".ipynb" else path.read_text(errors="replace")
 
         try:
-            tree = ast.parse(text)
+            with warnings.catch_warnings():   # invalid escapes etc. in the repository's code are not ours
+                warnings.simplefilter("ignore")
+                tree = ast.parse(text)
         except SyntaxError:
             if re.search(r"^\s*print\s+[\"'\w]", text, re.M) or re.search(r"except\s+\w+\s*,\s*\w+\s*:", text):
                 py2_files.append(rel)
@@ -408,7 +421,7 @@ def _collect_code(root: Path) -> tuple[list[Evidence], set[str], GPUUsage]:
     elif min_py:
         ev.append(Evidence("python", None, f">={min_py[0]}", min_py[1], "code",
                            f"syntax needs Python >= {min_py[0]}"))
-    return ev, imported, gpu
+    return ev, imported - local, gpu
 
 
 def _inferred(evidence: list[Evidence]) -> list[Evidence]:
@@ -465,7 +478,12 @@ def _resolve(fld: str, evidence: list[Evidence]) -> Resolved:
         )
 
     if fld == "python" and constraints:
-        # nothing concrete: pick the newest Python allowed by every constraint
+        # nothing concrete. Only lower bounds (">=3.6" from syntax): the fallback, if allowed.
+        # An upper bound (a framework's supported range) makes the newest allowed version a safe pick.
+        only_lower = all(part.strip().startswith(">") for c in constraints for part in c.split(","))
+        if only_lower and all(satisfies(PYTHON_FALLBACK, c) for c in constraints):
+            return Resolved(value=PYTHON_FALLBACK, confidence=0.4, constraints=constraints,
+                            sources=[f"no version given; {PYTHON_FALLBACK} satisfies the constraints"])
         for cand in PYTHON_CANDIDATES:
             if all(satisfies(cand, c) for c in constraints):
                 return Resolved(value=cand, confidence=0.4, constraints=constraints,
@@ -512,6 +530,8 @@ def detect_environment(
         if any(e.field == fw for e in evidence) or imported & FRAMEWORK_IMPORTS[fw]
     ]
 
+    third_party = sorted(m for m in imported if m and m not in sys.stdlib_module_names and not m.startswith("_"))
+
     resolved = {fld: _resolve(fld, evidence) for fld in FIELDS}
     # only report framework versions for frameworks that are actually used
     resolved = {k: v for k, v in resolved.items() if k in ("python", "cuda", "cudnn") or k in frameworks}
@@ -536,6 +556,7 @@ def detect_environment(
 
     return EnvironmentReport(
         root=str(root), frameworks=frameworks, resolved=resolved, gpu=gpu, evidence=evidence, notes=notes,
+        imports=third_party,
     )
 
 

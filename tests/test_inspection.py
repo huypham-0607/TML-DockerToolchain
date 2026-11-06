@@ -313,3 +313,40 @@ class TestInspect(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestImportsAndFallback(unittest.TestCase):
+    def test_third_party_imports_exclude_stdlib_and_local_modules(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t) / "uap"
+            make_repo(root, {
+                "main.py": "import os, sys, json\nimport numpy as np\nfrom uap.train.model import get\n"
+                           "from models.vgg import VGG\nimport helpers\nfrom PIL import Image\nimport _private\n",
+                "helpers.py": "import torch\n",
+                "models/vgg.py": "import torch.nn as nn\n",
+            })
+            imports = detect_environment(root).imports
+        self.assertEqual(imports, ["PIL", "numpy", "torch"])
+
+    def test_lower_bound_only_picks_310(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_repo(Path(t), {"a.py": "x = 1\nprint(f'{x}')\n"})
+            r = detect_environment(t).resolved["python"]
+        self.assertEqual(r.value, "3.10")
+
+    def test_lower_bound_above_310_still_works(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_repo(Path(t), {"a.py": "match x:\n    case 1:\n        pass\n", "pyproject.toml":
+                                "[project]\nname='x'\nrequires-python='>=3.11'\n"})
+            r = detect_environment(t).resolved["python"]
+        self.assertIn(r.value, ("3.11", "3.12", "3.13"))
+
+    def test_invalid_escape_in_repo_code_prints_no_warning(self):
+        import io
+        import warnings
+        with tempfile.TemporaryDirectory() as t:
+            make_repo(Path(t), {"a.py": "import re\nre.compile('\\{x\\}')\n"})
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                detect_environment(t)
+        self.assertFalse([w for w in caught if issubclass(w.category, SyntaxWarning)])

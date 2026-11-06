@@ -35,6 +35,74 @@ PYTORCH_INDEX = "https://download.pytorch.org/whl"
 PYPI = "https://pypi.org/simple"
 TORCH_BUILD_ENV = "TML_TORCH_BUILD"
 
+# Import name -> pip name, where they differ (imports not listed here are installed under their own name)
+IMPORT_TO_PIP = {
+    "PIL": "Pillow", "sklearn": "scikit-learn", "cv2": "opencv-python-headless", "yaml": "PyYAML",
+    "skimage": "scikit-image", "bs4": "beautifulsoup4", "attr": "attrs", "dateutil": "python-dateutil",
+    "Crypto": "pycryptodome", "art": "adversarial-robustness-toolbox", "tensorboardX": "tensorboardX",
+    "google": "protobuf", "dotenv": "python-dotenv", "jwt": "PyJWT", "serial": "pyserial", "magic": "python-magic",
+    "Levenshtein": "python-Levenshtein", "fitz": "PyMuPDF", "docx": "python-docx", "lightgbm": "lightgbm",
+    "pytorch_lightning": "pytorch-lightning", "timm": "timm", "einops": "einops", "keras": "keras",
+}
+# Imports that are never installed from a guess: torch-family packages come from the PyTorch index,
+# and these are not on PyPI under that name or need a manual setup
+NOT_GUESSED = set(TORCH_FAMILY) | {"apex", "mpi4py", "horovod", "IPython", "pkg_resources", "setuptools", "distutils"}
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def guessed_packages(imports: list[str], declared: dict[str, str | None]) -> list[str]:
+    """pip names for third-party imports that no dependency file declares."""
+    have = {_norm(n) for n in declared}
+    out = []
+    for module in imports:
+        if module in NOT_GUESSED:
+            continue
+        pip_name = IMPORT_TO_PIP.get(module, module)
+        if _norm(pip_name) not in have and _norm(module) not in have and pip_name not in out:
+            out.append(pip_name)
+    return out
+
+
+# torch major.minor -> (torchvision, torchaudio) major.minor released with it
+TORCH_COMPANIONS = {
+    "1.4": ("0.5", "0.4"), "1.5": ("0.6", "0.5"), "1.6": ("0.7", "0.6"), "1.7": ("0.8", "0.7"),
+    "1.8": ("0.9", "0.8"), "1.9": ("0.10", "0.9"), "1.10": ("0.11", "0.10"), "1.11": ("0.12", "0.11"),
+    "1.12": ("0.13", "0.12"), "1.13": ("0.14", "0.13"), "2.0": ("0.15", "2.0"), "2.1": ("0.16", "2.1"),
+    "2.2": ("0.17", "2.2"), "2.3": ("0.18", "2.3"), "2.4": ("0.19", "2.4"), "2.5": ("0.20", "2.5"),
+    "2.6": ("0.21", "2.6"), "2.7": ("0.22", "2.7"), "2.8": ("0.23", "2.8"),
+}
+
+
+def fix_companions(torch_pins: list[str]) -> tuple[list[str], list[str]]:
+    """Re-pins torchvision / torchaudio that do not match the pinned torch. Returns (pins, notes).
+
+    Each torch release works with one torchvision / torchaudio release; pip cannot install a
+    mismatched pair (torch==2.2.0 with torchvision==0.16.0 needs torch 2.1).
+    """
+    pins = {p.split("==")[0]: (p.split("==")[1] if "==" in p else None) for p in torch_pins}
+    mm = _major_minor(pins.get("torch"))
+    if mm not in TORCH_COMPANIONS:
+        return torch_pins, []
+    notes = []
+    for name, want in zip(("torchvision", "torchaudio"), TORCH_COMPANIONS[mm]):
+        have = pins.get(name)
+        if have and _major_minor(have) != want:
+            pins[name] = f"{want}.*"
+            notes.append(f"{name}=={have} does not work with torch=={pins['torch']}: changed to {name}=={want}.*")
+    return [f"{n}=={v}" if v else n for n, v in pins.items()], notes
+
+
+def _old_torch(torch_pins: list[str]) -> bool:
+    """True if torch is pinned below 2.3: those builds break with numpy 2."""
+    for pin in torch_pins:
+        if pin.startswith("torch==") and (m := re.match(r"(\d+)\.(\d+)", pin.split("==")[1])):
+            return (int(m.group(1)), int(m.group(2))) < (2, 3)
+    return False
+
+
 # A requirements line that pins (or names) a torch-family package: "torch==1.13.1+cu116", "torchvision>=0.8"
 TORCH_LINE_RE = r"^\s*(torch|torchvision|torchaudio)\s*($|[=<>!~;\[])"
 
@@ -122,7 +190,14 @@ def generate_dockerfile(repo_path: str | Path, torch_build: str | None = None) -
                 local_tags.append(local)
         elif name in FRAMEWORKS:
             other_pins.append(f"{name}=={version}" if version else name)
+    # imported but not declared anywhere (repositories without a requirements file): install unpinned
+    for name in TORCH_FAMILY:
+        if name in env.imports and name not in packages:
+            torch_pins.append(name)
     torch_pins.sort(key=lambda pin: TORCH_FAMILY.index(pin.split("==")[0]))
+    torch_pins, companion_notes = fix_companions(torch_pins)
+    notes += companion_notes
+    guessed = guessed_packages(env.imports, packages)
 
     reqs = [f for f in deps.files if Path(f).name == "requirements.txt"]
     installable = (root / "setup.py").is_file() or (root / "pyproject.toml").is_file()
@@ -139,6 +214,9 @@ def generate_dockerfile(repo_path: str | Path, torch_build: str | None = None) -
     if torch_pins:
         build = choose_torch_build(torch_build)
         index = torch_index(build, local_tags, env.resolved["cuda"].value)
+        if _old_torch(torch_pins) and not packages.get("numpy"):
+            torch_pins.append("numpy<2")
+            notes.append("numpy<2: torch below 2.3 does not work with numpy 2")
         quoted = " ".join(f'"{p}"' for p in torch_pins)
         if index:
             lines.append(f"RUN pip install --index-url {index} --extra-index-url {PYPI} {quoted}")
@@ -166,6 +244,12 @@ def generate_dockerfile(repo_path: str | Path, torch_build: str | None = None) -
             lines.append(f"RUN pip install -r {r}")
     if installable:
         lines.append("RUN pip install -e .")
+    if guessed:
+        # one at a time and never fatal: a wrong guess must not break the build
+        names = " ".join(guessed)
+        lines.append(f'RUN for p in {names}; do pip install "$p" || echo "could not install $p (guessed from imports)"; done')
+        notes.append(f"installed from imports that no dependency file declares (unpinned, best effort): {names}. "
+                     "Pin them, or remove any that are not real dependencies")
     lines.append('CMD ["bash"]')
 
     gpu = env.gpu
