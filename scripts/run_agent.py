@@ -38,11 +38,14 @@ def _one_line(s: str, n: int) -> str:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("prompt", nargs="+", help="the instruction for the agent")
-    p.add_argument("--limit", type=int, default=150, help="LangGraph recursion limit (2 per agent round)")
+    p.add_argument("--limit", type=int, default=0, help="LangGraph recursion limit, 2 per agent round (default: TML_STEP_LIMIT or 150)")
     p.add_argument("--log", default="", help="also write the full transcript to this file")
     args = p.parse_args()
 
     from src.agent import agent  # imported here so --help works without an API key
+    from src.main import step_limit
+
+    args.limit = args.limit or step_limit()
 
     log = open(args.log, "w") if args.log else None
 
