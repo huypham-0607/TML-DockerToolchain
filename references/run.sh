@@ -8,25 +8,19 @@
 # ffb, ep_bnp and uap: the Dockerfile clones the repository at the pinned commit itself.
 # ipmix: the repository is cloned into references/.repos/ipmix (git-ignored) first, and that
 # clone is the build context (its Dockerfile uses COPY .).
-# The URL / COMMIT tables below must match the ones in the Dockerfiles.
+# Repository URLs and pinned commits come from references/repos.txt.
 # Extra `docker build` arguments can go in BUILD_ARGS, e.g.
 #   BUILD_ARGS="--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu118" references/run.sh ipmix
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-declare -A URL=(
-  [ipmix]=https://github.com/hzlsaber/IPMix
-  [ffb]=https://github.com/ahxt/fair_fairness_benchmark
-  [ep_bnp]=https://github.com/RJ-T/NIPS2022_EP_BNP
-  [uap]=https://github.com/faiimea/UAP
-)
-declare -A COMMIT=(
-  [ipmix]=050bcb6cb562e0f45b9caf64b17283ef58b21a41
-  [ffb]=394f020e9d93cb195885ca5c67f411b175726e63
-  [ep_bnp]=af5150da52fe55aa0e265352576c435e1d9a39ab
-  [uap]=9f66dd0912b7c42ad3b74866036ff814a5609b0b
-)
+declare -A URL COMMIT
+NAMES=()
+while read -r name url commit; do
+  [[ -z "$name" || "$name" == \#* ]] && continue
+  URL[$name]=$url COMMIT[$name]=$commit NAMES+=("$name")
+done < "$HERE/repos.txt"
 
 run_one() {
   local name=$1 image="tml-ref/$1:latest" context
@@ -59,7 +53,7 @@ run_one() {
 }
 
 if [[ "${1:-}" == "all" ]]; then
-  for n in ipmix ffb ep_bnp uap; do run_one "$n"; done
+  for n in "${NAMES[@]}"; do run_one "$n"; done
 else
   run_one "${1:?usage: references/run.sh <ipmix|ffb|ep_bnp|uap|all>}"
 fi
