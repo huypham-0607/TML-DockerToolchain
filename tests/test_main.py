@@ -50,5 +50,24 @@ class TestMain(unittest.TestCase):
         self.assertIn("TML_STEP_LIMIT", err)
 
 
+    def test_missing_api_key_is_a_message(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("builtins.__import__", side_effect=self._importer(RuntimeError("GENAI_API_KEY is not set"))), \
+                mock.patch.object(sys, "argv", ["main", "x"]), redirect_stdout(out), redirect_stderr(err):
+            code = entry.main()
+        self.assertEqual(code, 2)
+        self.assertIn("GENAI_API_KEY is not set", err.getvalue())
+
+    @staticmethod
+    def _importer(error):
+        real = __import__
+
+        def fake(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "agent" and level == 1 or name == "src.agent":
+                raise error
+            return real(name, globals, locals, fromlist, level)
+        return fake
+
+
 if __name__ == "__main__":
     unittest.main()

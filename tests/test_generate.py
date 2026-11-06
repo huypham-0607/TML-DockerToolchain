@@ -37,7 +37,7 @@ class TestGenerateDockerfile(GenerateCase):
         })
         self.assertIn("FROM python:3.7-slim", text)
         self.assertIn(f'RUN pip install {CPU_INDEX} "torch==1.2.0" "torchvision==0.2.2"', text)
-        self.assertIn("pip install -r /tmp/requirements-0.txt", text)
+        self.assertIn(f"pip install -r /tmp/requirements-0.txt -c {generate.TORCH_CONSTRAINTS}", text)
         # frameworks are installed before the repo is copied (layer cache)
         self.assertLess(text.index("torch==1.2.0"), text.index("COPY . /workspace"))
         self.assertTrue(any("needs an NVIDIA GPU" in n and "train.py" in n for n in notes))
@@ -87,9 +87,14 @@ class TestTorchPins(GenerateCase):
         self.assertNotIn("download.pytorch.org", text)
 
     def test_requirements_cannot_reinstall_torch(self):
-        text, _, _ = self.gen("ffb", self.FFB)
-        grep_line = next(line for line in text.splitlines() if "grep" in line)
-        self.assertIn("requirements.txt > /tmp/requirements-0.txt", grep_line)
+        text, _, _ = self.gen("ffb", {**self.FFB, "a.py": "import folktables\n"})
+        lines = text.splitlines()
+        freeze = next(i for i, x in enumerate(lines) if "pip freeze" in x)
+        req = next(i for i, x in enumerate(lines) if "requirements.txt > /tmp/requirements-0.txt" in x)
+        guess = next(i for i, x in enumerate(lines) if x.startswith("RUN for p in"))
+        self.assertLess(freeze, req)
+        self.assertIn(f"-c {generate.TORCH_CONSTRAINTS}", lines[req])     # torch lines filtered AND pinned
+        self.assertIn(f"-c {generate.TORCH_CONSTRAINTS}", lines[guess])
 
     def test_other_frameworks_stay_on_pypi(self):
         text, _, _ = self.gen("tf", {"requirements.txt": "tensorflow==2.12.0\ntorch==2.0.1\n"})

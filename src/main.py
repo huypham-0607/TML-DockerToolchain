@@ -23,7 +23,11 @@ def step_limit() -> int:
 def main() -> int:
     from langgraph.errors import GraphRecursionError
 
-    from .agent import agent
+    try:
+        from .agent import agent
+    except (RuntimeError, ValueError) as e:   # a missing API key or an unknown LLM_PROVIDER (src/llm.py)
+        print(f"Cannot start the agent: {e}", file=sys.stderr)
+        return 2
 
     logging.getLogger("langchain_google_genai._function_utils").setLevel(logging.ERROR)
 

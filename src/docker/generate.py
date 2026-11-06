@@ -10,8 +10,8 @@
         (TML_TORCH_BUILD=cpu|cuda|auto overrides; default auto);
       - a pin with a local version (torch==1.13.1+cu116) is installed as torch==1.13.1 from the
         matching index: "+cuNNN" builds exist only there, so a plain `pip install` fails;
-      - those lines are filtered out of requirements files before `pip install -r`, so the
-        requirements cannot replace the build installed first.
+      - those lines are filtered out of requirements files before `pip install -r`, and every later
+        install runs with the installed versions as pip constraints, so nothing replaces that build.
 
     CLI:
       uv run python -m src.docker.generate /tmp/augmix
@@ -34,6 +34,7 @@ TORCH_FAMILY = ("torch", "torchvision", "torchaudio")
 PYTORCH_INDEX = "https://download.pytorch.org/whl"
 PYPI = "https://pypi.org/simple"
 TORCH_BUILD_ENV = "TML_TORCH_BUILD"
+TORCH_CONSTRAINTS = "/tmp/torch-constraints.txt"   # the torch-family versions installed first
 
 # Import name -> pip name, where they differ (imports not listed here are installed under their own name)
 IMPORT_TO_PIP = {
@@ -222,6 +223,9 @@ def generate_dockerfile(repo_path: str | Path, torch_build: str | None = None) -
             lines.append(f"RUN pip install --index-url {index} --extra-index-url {PYPI} {quoted}")
         else:
             lines.append(f"RUN pip install {quoted}")
+        # later installs must keep this torch: without a constraint, a package that asks for another
+        # torch version would make pip replace it (for example with the multi-GB CUDA build from PyPI)
+        lines.append(f"RUN pip freeze | grep -iE '^(torch|torchvision|torchaudio)==' > {TORCH_CONSTRAINTS}")
         if build == "cpu":
             notes.append(f"torch: CPU build ({PYTORCH_INDEX}/cpu). Docker on this machine cannot attach an NVIDIA GPU, "
                          f"or {TORCH_BUILD_ENV}=cpu. On a GPU host, use the CUDA index instead "
@@ -239,7 +243,7 @@ def generate_dockerfile(repo_path: str | Path, torch_build: str | None = None) -
     for i, r in enumerate(reqs):
         if torch_pins:
             filtered = f"/tmp/requirements-{i}.txt"
-            lines.append(f"RUN grep -viE '{TORCH_LINE_RE}' {r} > {filtered}; pip install -r {filtered}")
+            lines.append(f"RUN grep -viE '{TORCH_LINE_RE}' {r} > {filtered}; pip install -r {filtered} -c {TORCH_CONSTRAINTS}")
         else:
             lines.append(f"RUN pip install -r {r}")
     if installable:
@@ -247,7 +251,8 @@ def generate_dockerfile(repo_path: str | Path, torch_build: str | None = None) -
     if guessed:
         # one at a time and never fatal: a wrong guess must not break the build
         names = " ".join(guessed)
-        lines.append(f'RUN for p in {names}; do pip install "$p" || echo "could not install $p (guessed from imports)"; done')
+        keep = f" -c {TORCH_CONSTRAINTS}" if torch_pins else ""
+        lines.append(f'RUN for p in {names}; do pip install "$p"{keep} || echo "could not install $p (guessed from imports)"; done')
         notes.append(f"installed from imports that no dependency file declares (unpinned, best effort): {names}. "
                      "Pin them, or remove any that are not real dependencies")
     lines.append('CMD ["bash"]')
