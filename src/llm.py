@@ -76,6 +76,25 @@ def retry_wait(attempt: int) -> float:
     return RETRY_WAITS[min(attempt, len(RETRY_WAITS) - 1)]
 
 
+def clean_tool_name(name: str) -> str:
+    """gpt-oss sometimes leaks its chat-format tokens into a tool name, e.g.
+    'container_status<|channel|>commentary'. Keep the part before the first '<|'."""
+    return name.split("<|", 1)[0].strip() if name and "<|" in name else name
+
+
+def fix_tool_names(result):
+    """Clean the tool names of every tool call in a ChatResult, in place, and return it."""
+    for gen in getattr(result, "generations", []) or []:
+        msg = getattr(gen, "message", None)
+        for call in getattr(msg, "tool_calls", None) or []:
+            call["name"] = clean_tool_name(call.get("name", ""))
+        for call in (getattr(msg, "additional_kwargs", None) or {}).get("tool_calls", []) or []:
+            fn = call.get("function") or {}
+            if "name" in fn:
+                fn["name"] = clean_tool_name(fn["name"])
+    return result
+
+
 class RetryingChatOpenAI(ChatOpenAI):
     """ChatOpenAI that waits and retries when the server refuses for now (see is_retryable)."""
 
@@ -91,7 +110,7 @@ class RetryingChatOpenAI(ChatOpenAI):
     def _generate(self, *args, **kwargs):
         for attempt in range(self.rate_limit_retries + 1):
             try:
-                return super()._generate(*args, **kwargs)
+                return fix_tool_names(super()._generate(*args, **kwargs))
             except Exception as e:  # noqa: BLE001 - re-raised unless it is a retryable refusal
                 if attempt == self.rate_limit_retries or not is_retryable(e):
                     raise
@@ -101,7 +120,7 @@ class RetryingChatOpenAI(ChatOpenAI):
     async def _agenerate(self, *args, **kwargs):
         for attempt in range(self.rate_limit_retries + 1):
             try:
-                return await super()._agenerate(*args, **kwargs)
+                return fix_tool_names(await super()._agenerate(*args, **kwargs))
             except Exception as e:  # noqa: BLE001
                 if attempt == self.rate_limit_retries or not is_retryable(e):
                     raise
