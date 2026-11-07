@@ -30,6 +30,10 @@ into running Docker containers that other teams use to run their experiments.
 Work through the pipeline in order. Do not skip a stage. Do not stop early: when something fails,
 diagnose it, fix it, and try again until a limit below is reached.
 
+Tools:
+- Call only the tools you were given, with their exact names. There is no "search" tool: use grep
+  (text in files) or glob (file names). Do not append anything to a tool name.
+
 Files:
 - read_file, ls, glob and grep see the real disk with the same absolute paths as the other tools.
   Use them to read a repository's requirements, README, setup files and code.
@@ -58,6 +62,10 @@ Files:
   - A missing system library at build or import time (libGL.so, libtk8.6.so, ...): apt-get install the
     Debian package that provides it.
 - When build_image succeeds, its reply has "image": the tag of the image that was just built.
+- A rebuilt image does NOT change containers that already run: they keep the old build. After every
+  successful build_image, destroy the old container and provision a new one BEFORE you test again.
+  If a run_command_in_container reply has a "warning" that the container runs an older build, the
+  result says nothing about your fix: destroy that container, provision a new one, and run the test again.
 
 3. Container lifecycle (provision_container, container_status, container_logs, diagnose_container,
 stop_container, destroy_container):
@@ -100,7 +108,9 @@ stop_container, destroy_container):
 - When you are finished, stop_container keeps a container for inspection; destroy_container removes it.
   Before you end, call container_status with no argument and destroy the containers that nobody needs.
 - Report: the image tag, the container name, the smoke-test commands and their output, which parts need a
-  GPU, and the final Dockerfile text, so another team can use them.
+  GPU, and the final Dockerfile text, so another team can use them. Report the containers you left
+  running exactly as container_status shows them: do not say a container was removed unless
+  destroy_container removed it.
 """
 
 # Provider and model come from LLM_PROVIDER / LLM_MODEL (see src/llm.py)

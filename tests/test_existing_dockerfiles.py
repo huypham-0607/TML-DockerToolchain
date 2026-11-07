@@ -384,3 +384,27 @@ class TestRepoDockerfileEndToEnd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@requires_docker
+class TestStaleContainerLive(unittest.TestCase):
+    """Real daemon: rebuild a tag while a container from the old build is running."""
+
+    def test_old_container_warns_new_one_does_not(self):
+        from src.execution.tools import stale_image_warning
+
+        tag = f"tml-test/stale-{samples.RUN_ID}:latest"
+        names = [samples.container_name("stale-old"), samples.container_name("stale-new")]
+        with tempfile.TemporaryDirectory() as t:
+            ctx = Path(t)
+            try:
+                for name, version in zip(names, ("1", "2")):
+                    (ctx / "Dockerfile").write_text(f"FROM {BASE}\nENV BUILD={version}\nLABEL tml.test={samples.RUN_ID}\n")
+                    subprocess.run(["docker", "build", "-q", "-t", tag, str(ctx)], check=True, capture_output=True)
+                    subprocess.run(["docker", "run", "-d", "--name", name, "--label", f"tml.test={samples.RUN_ID}",
+                                    tag, "sleep", "120"], check=True, capture_output=True)
+                self.assertIn("OLDER build", stale_image_warning(names[0]))
+                self.assertIsNone(stale_image_warning(names[1]))
+            finally:
+                subprocess.run(["docker", "rm", "-f", *names], capture_output=True)
+                subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
