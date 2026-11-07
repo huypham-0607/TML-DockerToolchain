@@ -309,3 +309,13 @@ class TestFixesFromTheAgentRuns(GenerateCase):
         text, _, _ = self.gen("plainrepo", {"main.py": "import os\n"})
         self.assertIn("COPY . /workspace", text.splitlines())
         self.assertNotIn("PYTHONPATH", text)
+
+
+class TestSetuptools(GenerateCase):
+    def test_pkg_resources_stays_available(self):
+        # UAP: art (Adversarial Robustness Toolbox 1.17) imports pkg_resources.packaging
+        text, _, notes = self.gen("st", {"a.py": "import numpy\n"})
+        lines = text.splitlines()
+        self.assertIn('RUN pip install "setuptools<70"', lines)
+        self.assertLess(lines.index('RUN pip install "setuptools<70"'), lines.index("COPY . /workspace"))
+        self.assertTrue(any("pkg_resources" in n for n in notes))

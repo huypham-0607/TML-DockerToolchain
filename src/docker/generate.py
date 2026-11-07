@@ -36,6 +36,11 @@ PYPI = "https://pypi.org/simple"
 TORCH_BUILD_ENV = "TML_TORCH_BUILD"
 TORCH_CONSTRAINTS = "/tmp/torch-constraints.txt"   # the torch-family versions installed first
 
+# Installed first in every image: research code and its older dependencies often import
+# pkg_resources, which setuptools 81 removed (pkg_resources.packaging went in 70). The Adversarial
+# Robustness Toolbox 1.17 (UAP) fails at import without it.
+SETUPTOOLS_PIN = "setuptools<70"
+
 # Import name -> pip name, where they differ (imports not listed here are installed under their own name)
 IMPORT_TO_PIP = {
     "PIL": "Pillow", "sklearn": "scikit-learn", "cv2": "opencv-python-headless", "yaml": "PyYAML",
@@ -275,6 +280,9 @@ def generate_dockerfile(repo_path: str | Path, torch_build: str | None = None) -
         "    && rm -rf /var/lib/apt/lists/*",
         "WORKDIR /workspace",
     ]
+
+    lines.append(f'RUN pip install "{SETUPTOOLS_PIN}"')
+    notes.append(f"{SETUPTOOLS_PIN}: older code and packages import pkg_resources, which newer setuptools removed")
 
     # Frameworks first, in their own layers (largest downloads, cached across rebuilds)
     if torch_pins:
