@@ -13,8 +13,9 @@
     (https://docs.rcac.purdue.edu/services/genai/api/). Two things keep a run going:
       - a client-side limiter, set to LLM_REQUESTS_PER_MINUTE (default: the provider's value);
       - retries with waiting when the server still refuses. RCAC answers a rate limit with HTTP 400
-        ("Rate limit exceeded"), not 429, so the OpenAI client's own retries never fire, and it may
-        answer with JSON null instead of an error. Both are retried LLM_RATE_RETRIES times (default 6),
+        ("Rate limit exceeded"), not 429, so the OpenAI client's own retries never fire; a busy backend
+        also comes as HTTP 400 ("Open WebUI: Server Connection Error"); and it may answer with JSON null
+        instead of an error. All of these are retried LLM_RATE_RETRIES times (default 6),
         waiting 15 s, 30 s, then 60 s between tries.
 """
 
@@ -52,10 +53,19 @@ DEFAULT_RATE_RETRIES = 6
 RETRY_WAITS = (15.0, 30.0, 60.0)   # seconds before retry 1, 2, and 3 onwards
 
 
+# Answers that mean "not now" rather than "wrong request". RCAC sends several of them as HTTP 400:
+# "Rate limit exceeded", and "Open WebUI: Server Connection Error" when its model backend is busy.
+RETRYABLE_TEXT = (
+    "rate limit", "too many requests", "error code: 429",
+    "server connection error", "temporarily unavailable", "service unavailable", "bad gateway",
+    "gateway timeout", "error code: 502", "error code: 503", "error code: 504",
+)
+
+
 def is_retryable(error: BaseException) -> bool:
-    """True for a refused-for-now answer: a rate limit, or the null body RCAC sends instead of an error."""
+    """True for a refused-for-now answer: a rate limit or a busy server, or the null body RCAC sends instead of an error."""
     text = str(error).lower()
-    if "rate limit" in text or "too many requests" in text or "error code: 429" in text:
+    if any(t in text for t in RETRYABLE_TEXT):
         return True
     # a JSON null body breaks response parsing with a NoneType error deep in the client
     return isinstance(error, (TypeError, AttributeError)) and "nonetype" in text

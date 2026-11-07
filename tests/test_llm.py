@@ -33,6 +33,11 @@ class TestIsRetryable(unittest.TestCase):
     def test_rcac_rate_limit_400(self):
         self.assertTrue(llm.is_retryable(FakeBadRequest(RCAC_RATE_LIMIT)))
 
+    def test_rcac_server_connection_error(self):
+        # ended the UAP agent run after 26 minutes (Sat 7 Nov)
+        self.assertTrue(llm.is_retryable(FakeBadRequest("Error code: 400 - {'detail': 'Open WebUI: Server Connection Error'}")))
+        self.assertTrue(llm.is_retryable(Exception("Error code: 503 - Service Unavailable")))
+
     def test_429(self):
         self.assertTrue(llm.is_retryable(Exception("Error code: 429 - Too Many Requests")))
 
