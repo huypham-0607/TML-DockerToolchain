@@ -259,6 +259,11 @@ def main(argv: list[str] | None = None) -> int:
     if unknown:
         p.error(f"unknown repositories {unknown}; choose from {list(repos)}")
     mode = "agent" if args.agent else "template"
+    # without a daemon every image check says "missing": stop with the real reason instead
+    if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+        print("Docker is not reachable: start Docker Desktop (or the Docker daemon), wait until it runs, "
+              "and try again. Check with: docker version", file=sys.stderr)
+        return 2
 
     results = [evaluate_one(n, *repos[n], mode=mode, skip_build=args.skip_build) for n in names]
 

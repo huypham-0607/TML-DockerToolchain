@@ -116,6 +116,18 @@ class TestEvaluateOne(unittest.TestCase):
             r = ev.evaluate_one("ffb", "u", "0" * 40, mode="template", skip_build=False)
         self.assertIn("pipeline error: RuntimeError: boom", r.build_note)
 
+    def test_docker_down_is_a_clear_error_not_missing_images(self):
+        import io
+        from contextlib import redirect_stderr
+        down = subprocess.CompletedProcess(["docker", "info"], 1, "", "Cannot connect to the Docker daemon")
+        err = io.StringIO()
+        with mock.patch.object(ev.subprocess, "run", return_value=down), redirect_stderr(err), \
+                mock.patch.object(ev, "evaluate_one") as one:
+            code = ev.main(["--agent", "--skip-build"])
+        self.assertEqual(code, 2)
+        self.assertIn("Docker is not reachable", err.getvalue())
+        one.assert_not_called()
+
     def test_unknown_name_is_a_usage_error(self):
         with self.assertRaises(SystemExit):
             ev.main(["nope"])
