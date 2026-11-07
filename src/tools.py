@@ -1,21 +1,9 @@
 """
-    Temp tools for now
+    Agent tools for inspection and dockerization (sections A-D and the Dockerfile tools).
+    The lifecycle and execution tools are in src/lifecycle/tools.py and src/execution/tools.py.
 """
 
 from langchain_core.tools import tool
-
-@tool
-def meow() -> str:
-    """Returns string Meow
-    """
-
-    return f"Meow"
-
-@tool
-def woof() -> str:
-    """Returns woof
-    """
-    return f"Woof"
 
 @tool
 def inspect_repo(repo_path: str, search: bool = False) -> str:
@@ -54,8 +42,10 @@ def build_image(repo_path: str, dockerfile: str, tag: str = "") -> str:
 def generate_dockerfile(repo_path: str) -> str:
     """Inspects a local repository and generates a starter Dockerfile for it from a template
     (Python version, framework pins, requirements files). Does not build.
-    Returns JSON: dockerfile text, the path it was saved to, and notes (e.g. needs --gpus all).
-    Review or edit the text, then pass it to build_image.
+    PyTorch comes from the PyTorch index: the CPU build when Docker here has no usable NVIDIA GPU,
+    else the CUDA build; "+cuNNN" pins are handled.
+    Returns JSON: dockerfile text, the path it was saved to, and notes (torch build, code that
+    needs a GPU, the repository's own Docker config). Review or edit the text, then pass it to build_image.
 
     Args:
         repo_path: path to the repository root on this machine.

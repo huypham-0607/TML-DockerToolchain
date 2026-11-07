@@ -1,0 +1,7 @@
+# The four reference repositories: name, URL, pinned commit.
+# references/run.sh and scripts/evaluate.py read this file. The Dockerfiles that clone the
+# repository themselves (ffb, ep_bnp, uap) contain the same URL and commit: keep them in step.
+ipmix   https://github.com/hzlsaber/IPMix                      050bcb6cb562e0f45b9caf64b17283ef58b21a41
+ffb     https://github.com/ahxt/fair_fairness_benchmark        394f020e9d93cb195885ca5c67f411b175726e63
+ep_bnp  https://github.com/RJ-T/NIPS2022_EP_BNP                af5150da52fe55aa0e265352576c435e1d9a39ab
+uap     https://github.com/faiimea/UAP                         9f66dd0912b7c42ad3b74866036ff814a5609b0b

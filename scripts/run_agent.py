@@ -35,16 +35,16 @@ def _one_line(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 3] + "..."
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("prompt", nargs="+", help="the instruction for the agent")
-    p.add_argument("--limit", type=int, default=150, help="LangGraph recursion limit (2 per agent round)")
-    p.add_argument("--log", default="", help="also write the full transcript to this file")
-    args = p.parse_args()
+def run_agent(prompt: str, limit: int = 0, log_path: str = "", agent=None) -> dict:
+    """Runs the agent on `prompt`, printing every step. Returns a summary:
+    rounds, seconds, tools_used, images_built (tags of successful build_image calls, in order),
+    last_ai (the agent's last text), crashed (error text or "")."""
+    if agent is None:
+        from src.agent import agent  # imported here so --help works without an API key
+    from src.main import step_limit
 
-    from src.agent import agent  # imported here so --help works without an API key
-
-    log = open(args.log, "w") if args.log else None
+    limit = limit or step_limit()
+    log = open(log_path, "w") if log_path else None
 
     def out(line: str = "", full: str | None = None) -> None:
         print(line, flush=True)
@@ -52,18 +52,16 @@ def main() -> int:
             log.write((full if full is not None else line) + "\n")
             log.flush()
 
-    prompt = " ".join(args.prompt)
     out(f"PROMPT: {prompt}")
-    out(f"step limit: {args.limit}\n")
+    out(f"step limit: {limit}\n")
 
     start = time.time()
-    rounds = 0
-    tools_used: dict[str, int] = {}
-    last_ai = ""
+    summary = {"rounds": 0, "seconds": 0.0, "tools_used": {}, "images_built": [], "last_ai": "", "crashed": ""}
+    tools_used = summary["tools_used"]
     try:
         for update in agent.stream(
             {"messages": [{"role": "user", "content": prompt}]},
-            config={"recursion_limit": args.limit},
+            config={"recursion_limit": limit},
             stream_mode="updates",
         ):
             for node, data in update.items():
@@ -74,10 +72,11 @@ def main() -> int:
                     kind = getattr(m, "type", "")
                     stamp = f"[{time.time() - start:6.0f}s]"
                     if kind == "ai":
-                        rounds += 1
+                        summary["rounds"] += 1
+                        rounds = summary["rounds"]
                         text = _text(m.content).strip()
                         if text:
-                            last_ai = text
+                            summary["last_ai"] = text
                             out(f"{stamp} round {rounds} AGENT SAYS: {_one_line(text, SHORT)}",
                                 f"{stamp} round {rounds} AGENT SAYS:\n{text}")
                         for call in getattr(m, "tool_calls", []) or []:
@@ -89,21 +88,43 @@ def main() -> int:
                     elif kind == "tool":
                         text = _text(m.content)
                         name = getattr(m, "name", "?")
+                        if name == "build_image":
+                            try:
+                                reply = json.loads(text)
+                                if reply.get("success") and reply.get("image"):
+                                    summary["images_built"].append(reply["image"])
+                            except (ValueError, AttributeError):
+                                pass
                         out(f"{stamp}   <- {name}: {_one_line(text, SHORT)}", f"{stamp}   <- {name}:\n{text}")
     except KeyboardInterrupt:
+        summary["crashed"] = "stopped by Ctrl+C"
         out("\nSTOPPED by Ctrl+C")
     except Exception as e:  # noqa: BLE001 - report any crash, then the summary
+        summary["crashed"] = f"{type(e).__name__}: {e}"
         out(f"\nCRASHED: {type(e).__name__}: {_one_line(str(e), 500)}", f"\nCRASHED: {type(e).__name__}: {e}")
     finally:
+        summary["seconds"] = round(time.time() - start, 1)
         out("\n==== SUMMARY ====")
-        out(f"time: {time.time() - start:.0f}s, agent rounds: {rounds}")
+        out(f"time: {summary['seconds']:.0f}s, agent rounds: {summary['rounds']}")
         out("tool calls: " + (", ".join(f"{k} x{v}" for k, v in sorted(tools_used.items())) or "none"))
-        if last_ai:
-            out("\nLAST THING THE AGENT SAID:\n" + last_ai)
+        if summary["images_built"]:
+            out("images built: " + ", ".join(summary["images_built"]))
+        if summary["last_ai"]:
+            out("\nLAST THING THE AGENT SAID:\n" + summary["last_ai"])
         if log:
             log.close()
-            print(f"\nfull transcript: {Path(args.log).resolve()}")
-    return 0
+            print(f"\nfull transcript: {Path(log_path).resolve()}")
+    return summary
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("prompt", nargs="+", help="the instruction for the agent")
+    p.add_argument("--limit", type=int, default=0, help="LangGraph recursion limit, 2 per agent round (default: TML_STEP_LIMIT or 150)")
+    p.add_argument("--log", default="", help="also write the full transcript to this file")
+    args = p.parse_args()
+    summary = run_agent(" ".join(args.prompt), limit=args.limit, log_path=args.log)
+    return 1 if summary["crashed"] else 0
 
 
 if __name__ == "__main__":

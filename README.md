@@ -11,6 +11,7 @@ The toolchain changes a research repository into a validated Docker environment.
 - [Project Scope](#project-scope)
 - [Setup](#setup)
 - [Status](#status)
+- [Evaluation Against the Reference Dockerfiles](#evaluation-against-the-reference-dockerfiles)
 - [Agent Toolchain Categories](#agent-toolchain-categories)
 - [Agent Workflow](#agent-workflow)
 - [Project Layout](#project-layout)
@@ -92,6 +93,10 @@ The toolchain changes a research repository into a validated Docker environment.
 | `OPENAI_API_KEY` | If `LLM_PROVIDER=openai` | The key for the OpenAI API. |
 | `LANGSMITH_TRACING` | No | Set to `true` to record LangSmith traces. |
 | `LANGSMITH_API_KEY` | No | Necessary only if LangSmith tracing is on. |
+| `LLM_REQUESTS_PER_MINUTE` | No | Client-side request limit. Default: 18 for `rcac` (Purdue GenAI allows 20 per minute per user), 120 for `openai`. |
+| `LLM_RATE_RETRIES` | No | How often a refused request ("Rate limit exceeded") is retried, waiting 15 s, 30 s, then 60 s. Default 6. |
+| `TML_STEP_LIMIT` | No | The agent's step limit (LangGraph recursion limit, 2 steps per agent round). Default 150. |
+| `TML_TORCH_BUILD` | No | `cpu`, `cuda` or `auto` (default): which PyTorch build `generate_dockerfile` installs. `auto` uses the CUDA build only if Docker on this machine can attach an NVIDIA GPU. |
 
 > **Caution:** Do not commit `.env`. Git ignores this file.
 
@@ -106,6 +111,8 @@ The toolchain changes a research repository into a validated Docker environment.
 
 To add a provider, add an entry to `PROVIDERS` in `src/llm.py`.
 
+Purdue GenAI allows 20 requests per minute per user ([RCAC GenAI API](https://docs.rcac.purdue.edu/services/genai/api/)). It answers a rate limit with HTTP 400 ("Rate limit exceeded") instead of 429, so the OpenAI client does not retry it, and it can answer with a JSON `null` instead of an error. `src/llm.py` keeps the request rate under the limit and retries both cases with waits.
+
 ### Run
 
 - Do a check of the installation. This command prints `Hello from tml-dockertoolchain!`.
@@ -114,11 +121,23 @@ To add a provider, add an entry to `PROVIDERS` in `src/llm.py`.
   uv run main.py
   ```
 
-- Start the placeholder agent with a question. If you give no question, the agent uses `Hello world!`.
-  The agent prints its last reply.
+- Check the LLM connection, tool calling, and (with `--repo`) one inspection by the agent:
 
   ```bash
-  uv run python -m src.main "your question"
+  uv run python -m scripts.smoke_test
+  uv run python -m scripts.smoke_test --repo /abs/path/to/a/repository
+  ```
+
+- Containerize a repository with the agent. Give the absolute path of a local clone. The agent prints its last reply.
+
+  ```bash
+  uv run python -m src.main "Containerize the repository at /abs/path/to/repo. At the end, show the final Dockerfile you used."
+  ```
+
+- The same, but every step is printed while the agent works (each tool call, its arguments and the start of its reply), with a summary at the end, also when the agent crashes or runs out of steps. `--log` saves the full transcript.
+
+  ```bash
+  uv run python -m scripts.run_agent --log runs/agent.log "Containerize the repository at /abs/path/to/repo"
   ```
 
 ## Status
@@ -128,7 +147,7 @@ All four toolchains are implemented and connected to the agent in `src/agent.py`
 | Toolchain | Package | State |
 | --- | --- | --- |
 | Repository inspection | `src/repo/` | Sections A to D, combined by `inspect.py` |
-| Dockerization | `src/docker/` | First version: one `python:<ver>-slim` template (`generate.py`) and a `docker build` wrapper (`build.py`) |
+| Dockerization | `src/docker/` | One `python:<ver>-slim` template (`generate.py`): PyTorch from the PyTorch index (CPU or CUDA build), `+cuNNN` pins, matched torchvision / torchaudio, packages imported but not declared. A `docker build` wrapper (`build.py`). |
 | Container lifecycle | `src/lifecycle/` | Provision, status, logs, diagnosis with hints, stop, destroy |
 | Container execution | `src/execution/` | `docker exec` with structured results and a timeout |
 
@@ -158,9 +177,14 @@ Sections:
 | --- | --- |
 | `main.py` | Placeholder. Prints a greeting. |
 | `src/main.py` | Command-line entry point. Sends one question to the agent and prints the last reply. |
-| `src/agent.py` | Makes the agent with `deepagents`, with all the tools and one pipeline system prompt. Gets the model from `src/llm.py`. |
-| `src/llm.py` | Makes the chat model for the provider in `LLM_PROVIDER` (OpenAI or Purdue GenAI). The rate limit is 2 requests each second. |
-| `src/tools.py` | The tools `inspect_repo`, `generate_dockerfile`, and `build_image`. Also still contains the two placeholder tools `meow` and `woof`. |
+| `src/agent.py` | Makes the agent with `deepagents`, with all the tools and one pipeline system prompt. Gets the model from `src/llm.py` and the file backend from `src/fs_backend.py`. |
+| `src/fs_backend.py` | The backend of the agent's built-in file tools (`ls`, `read_file`, `glob`, `grep`): the real disk, read-only, without secret files such as `.env`. Writes go only to an in-memory `/agent_scratch/`. |
+| `src/llm.py` | Makes the chat model for the provider in `LLM_PROVIDER` (OpenAI or Purdue GenAI): 18 requests per minute for Purdue GenAI, and retries when the server refuses for now. |
+| `src/tools.py` | The tools `inspect_repo`, `generate_dockerfile`, and `build_image`. |
+| `scripts/smoke_test.py` | Checks the configuration, the LLM endpoint, tool calling, and one agent inspection. |
+| `scripts/run_agent.py` | Runs the agent and prints every step. |
+| `scripts/evaluate.py` | Scores the pipeline against the reference Dockerfiles. Refer to [Evaluation](#evaluation-against-the-reference-dockerfiles). |
+| `references/` | Hand-made reference Dockerfiles and CPU smoke tests for the four target repositories. Refer to `references/README.md`. |
 | `src/lifecycle/tools.py` | The six lifecycle tools: `provision_container`, `container_status`, `container_logs`, `diagnose_container`, `stop_container`, `destroy_container`. |
 | `src/execution/tools.py` | The tool `run_command_in_container`. |
 | `pyproject.toml`, `uv.lock`, `.python-version` | Project metadata, locked dependencies, and the Python version. |
@@ -175,11 +199,49 @@ The tests use `unittest` and do not call the LLM:
 uv run python -m unittest discover -s tests -t .
 ```
 
-With the Docker daemon running, all 684 tests run (about 5 minutes). One GPU-detection test in `tests/lifecycle/` fails at this time.
+With the Docker daemon running, all tests run (more than 800, about 5 minutes). Without Docker, the tests that need it are skipped. Set `TML_TEST_BASE_IMAGE` to use another base image for the Docker tests (default `python:3.14-slim`, pulled once).
+
+| Test file | What it covers |
+| --- | --- |
+| `tests/test_structure.py`, `tests/test_inspection.py` | Repository inspection, sections A to D |
+| `tests/test_generate.py`, `tests/test_build.py` | The Dockerfile template (PyTorch builds, `+cuNNN` pins, imports, torchvision pairs) and the build wrapper |
+| `tests/test_existing_dockerfiles.py` | Toy repositories that ship their own Dockerfile: inspection, real builds, existing images, build context, Dockerfile to container to command |
+| `tests/lifecycle/` | The six lifecycle tools, with a fake Docker client and with the real daemon |
+| `tests/test_exec.py` | Command execution |
+| `tests/test_agent_files.py` | The agent's file tools: the real repository is readable, writes and secrets are refused (also inside a real `deepagents` graph, with a scripted model) |
+| `tests/test_llm.py`, `tests/test_main.py` | Rate-limit retries, model settings, the step limit |
+| `tests/test_evaluate.py` | The evaluation script |
 
 These parts of the design are not in the repository at this time:
 
-- Dockerfile templates for conda and PyTorch + CUDA
+- Dockerfile templates for conda and for CUDA base images (`nvidia/cuda`) for code that compiles CUDA
+
+## Evaluation Against the Reference Dockerfiles
+
+`references/` has a hand-made Dockerfile for each of the four target repositories (IPMix, Fair Fairness Benchmark, EP/BNP, UAP), with a CPU smoke test (`smoke.py`) that runs the repository's own code without a GPU, a dataset or the network. `references/README.md` lists the problems in each repository that the Dockerfiles had to work around: the cases the pipeline must handle.
+
+1. Build and test the references (once):
+
+   ```bash
+   references/run.sh all
+   ```
+
+2. Score the pipeline against them:
+
+   ```bash
+   uv run python -m scripts.evaluate                 # template step only: no LLM, no API key
+   uv run python -m scripts.evaluate --agent ffb     # the full agent on one repository (10 to 40 minutes)
+   ```
+
+For each repository, `scripts/evaluate.py` clones it at the pinned commit (`references/repos.txt`), lets the pipeline build an image, and reports:
+
+| Column | Meaning |
+| --- | --- |
+| Builds | The pipeline produced an image. |
+| Python, torch, torchvision | The versions in the pipeline's image, and whether they match the reference image. |
+| Smoke test | The reference `smoke.py` passes in the pipeline's image. |
+
+The table is saved to `runs/eval/results.md` and `runs/eval/results.json`. The agent's transcript for each repository is saved to `runs/eval/<name>-agent.log`.
 
 ## Agent Toolchain Categories
 
@@ -194,10 +256,12 @@ These parts of the design are not in the repository at this time:
 
 Keep the main LLM-facing tools high-level. The agent (`src/agent.py`) has these tools at this time. The docstring of each tool is the description that the LLM reads.
 
+`deepagents` also gives the agent a todo list and file tools (`ls`, `read_file`, `glob`, `grep`, `write_file`, `edit_file`). By default those work on an empty in-memory filesystem, so the agent could not read the repository. `src/fs_backend.py` connects them to the real disk, read-only: the agent reads requirements, READMEs and code with them, never changes the repository, and cannot read secret files (`.env`, SSH and cloud keys).
+
 | Tool | Description of input arguments | Description of output arguments | Tool description |
 | --- | --- | --- | --- |
-| `inspect_repo` | • `repo_path` (str, required): path to a local repository root.<br>• `search` (bool, default `False`): when `True`, run a Google search if the README has no install commands. | JSON string (`RepoProfile.summary()`) with these fields:<br>• Structure: `root`, `primary_language`, `languages`, `total_files`, `tree`, `important_files`, `existing_docker`, `large_files`<br>• Dependencies: `dependency_files`, `python_requires`, `packages` (name → pinned version), `conda_channels`, `index_urls`<br>• Docs: `install_commands`, `setup_sections`, `search_results`<br>• Environment: `environment` (Python/CUDA/cuDNN/framework versions, each with `value`, `confidence`, `constraints` and `conflict`), `frameworks`, `gpu` (`uses_cuda`, `gpu_required`, `needs_nvcc`, `hardcoded_cuda`)<br>• `warnings` | Inspects a local repository without running its code and returns what is needed to containerize it: its structure, dependencies, setup steps from the docs, and the Python, CUDA and framework versions it needs. Fully deterministic (no LLM), apart from the optional search. Wraps `inspect_repository()`. |
-| `generate_dockerfile` | • `repo_path` (str, required): path to a local repository root. | JSON string with these fields:<br>• `dockerfile`: the Dockerfile text<br>• `dockerfile_path`: where it was saved (`runs/<repo>/Dockerfile`)<br>• `notes`: hints for the LLM, for example "repo uses CUDA: run the container with --gpus all", "repo compiles CUDA code: base image likely needs to be nvidia/cuda:\<ver\>-devel", or "Python version not found; defaulting to 3.10" | Inspects the repository and makes a starter Dockerfile from one template: `python:<ver>-slim`, framework pins in their own layer, `pip install -r requirements.txt`, and `pip install -e .` if the repository is installable. Does not build. The LLM can edit the text before it calls `build_image`. Wraps `docker.generate.generate_dockerfile()`. |
+| `inspect_repo` | • `repo_path` (str, required): path to a local repository root.<br>• `search` (bool, default `False`): when `True`, run a Google search if the README has no install commands. | JSON string (`RepoProfile.summary()`) with these fields:<br>• Structure: `root`, `primary_language`, `languages`, `total_files`, `tree`, `important_files`, `existing_docker`, `large_files`<br>• Dependencies: `dependency_files`, `python_requires`, `packages` (name → pinned version), `conda_channels`, `index_urls`<br>• Docs: `install_commands`, `setup_sections`, `search_results`<br>• Environment: `environment` (Python/CUDA/cuDNN/framework versions, each with `value`, `confidence`, `constraints` and `conflict`), `frameworks`, `third_party_imports` (top-level modules the code imports, without the standard library and the repository's own modules), `gpu` (`uses_cuda`, `gpu_required`, `needs_nvcc`, `hardcoded_cuda`)<br>• `warnings` | Inspects a local repository without running its code and returns what is needed to containerize it: its structure, dependencies, setup steps from the docs, and the Python, CUDA and framework versions it needs. Fully deterministic (no LLM), apart from the optional search. Wraps `inspect_repository()`. |
+| `generate_dockerfile` | • `repo_path` (str, required): path to a local repository root. | JSON string with these fields:<br>• `dockerfile`: the Dockerfile text<br>• `dockerfile_path`: where it was saved (`runs/<repo>/Dockerfile`)<br>• `notes`: hints for the LLM, for example which PyTorch build was chosen, "code calls CUDA without checking for a GPU (file:line): that code needs an NVIDIA GPU", torchvision re-pinned to match torch, packages installed from imports, or the repository's own Docker configuration | Inspects the repository and makes a starter Dockerfile from one template: `python:<ver>-slim`; torch / torchvision / torchaudio from the PyTorch index in their own layer (CPU build, or the CUDA build when Docker here can attach an NVIDIA GPU; `TML_TORCH_BUILD` overrides), without `+cuNNN` suffixes and with matching versions; `pip install -r` of each requirements file with the torch lines filtered out; `pip install -e .` if the repository is installable; imported packages that no file declares, best effort. Does not build. The LLM can edit the text before it calls `build_image`. Wraps `docker.generate.generate_dockerfile()`. |
 | `build_image` | • `repo_path` (str, required): path to a local repository root; the build context.<br>• `dockerfile` (str, required): the complete Dockerfile text.<br>• `tag` (str, default `""`): image tag; empty gives `tml/<repo-name>:latest`. | JSON string (`BuildResult`) with these fields:<br>• `success`, `image` (the tag, or null if the build failed), `exit_code`<br>• `log_tail`: the last 4000 characters of the build log<br>• `log_path`, `dockerfile_path` (both in `runs/<repo>/`)<br>• `timed_out` | Runs `docker build` on Dockerfile text, with the repository as the build context. If the build fails, the LLM reads `log_tail`, fixes the Dockerfile, and calls the tool again (at most 5 attempts). Timeout: 1 hour. Wraps `docker.build.build_image()`. |
 | `provision_container` | • `image` (str): tag or id of an image that is already on this machine.<br>• `dockerfile` (str): path to a Dockerfile to build and run instead. Give exactly one of `image` or `dockerfile`.<br>• `context` (str): build context; default is the Dockerfile's directory.<br>• `name` (str): container name; generated when empty.<br>• `mode` (str, default `idle`): `idle` keeps the container running for later commands; `native` runs the image's own command.<br>• `command` (str): native mode only, instead of the image's `CMD`.<br>• `gpu` (str, default `auto`): `auto` (a GPU if Docker can attach one, otherwise none), `all` (fail without a GPU), or `none`.<br>• `env` (dict): environment variables.<br>• `mounts` (list): `host:container[:ro]`, only from `runs/` and `TML_MOUNT_ROOTS`.<br>• `ports` (list): `host:container` or `container`, on 127.0.0.1 only.<br>• `memory` (str): limit such as `8g`; default 75% of the host memory, with no swap.<br>• `shm_size` (str, default `2g`): size of `/dev/shm`.<br>• `user` (str): for example `1000:1000`; default is the image's user (root for most images).<br>• `ready_timeout` (float, default 0): seconds; 0 gives 30, or 120 with a HEALTHCHECK.<br>• `replace` (bool, default `False`): replace a container of this name with different settings. | JSON string with these fields:<br>• `ok`: `true` when the container is ready, or (native mode) when its command ended with code 0<br>• `action`: `created`, `replaced`, `reused`, or `restarted`<br>• `image`: `id`, `tag`, `built`, `builder`<br>• `status`: the same fields as `container_status`<br>• `notes`: what provision had to change, for example a start without the GPU<br>• `diagnosis` (only when the container started but is not usable): `logs`, `hints`, `processes`, `resources`, `events`, `notes`<br>• `error` (only for a failed request): `code`, `message`, `hint` | Starts a Docker container and waits until it is ready. Images are never pulled; a Dockerfile is built once and reused while its text and context path do not change. The container is never privileged and never gets the host network or the Docker socket. A container with the same name and settings is reused; other settings give `name_conflict` unless `replace` is true. A container that starts and then fails is not an error: the reply carries its diagnosis. Wraps `lifecycle.provision.provision()`. |
 | `container_status` | • `container` (str, default `""`): container name or id; empty lists all containers that the toolchain made. | JSON string with these fields:<br>• `ok`<br>• `status` (one container): `container`, `state`, `health`, `reason`, `usable`, `exit_code`, `oom_killed`, `restart_count`, `started_at`, `finished_at`, `error`, `healthcheck_output`, `handle` (`name`, `id`, `image`, `mode`, `gpu`, `workdir`, `ports`, `mounts`). Empty fields are left out.<br>• `containers` (no argument): a list of `status` objects, oldest first | Reports the state and health of a container. Health is one of `starting`, `healthy`, `unhealthy`, `completed` (ended with code 0), `stopped`, `failed`, or `missing`. `usable` is `true` when commands can run in it. A missing container is not an error. Containers that the toolchain did not make are refused (`not_managed`). Wraps `get_status()` and `list_managed()`. |
@@ -206,7 +270,6 @@ Keep the main LLM-facing tools high-level. The agent (`src/agent.py`) has these 
 | `stop_container` | • `container` (str, required): container name or id.<br>• `timeout` (int, default 10): seconds to wait after SIGTERM before SIGKILL, 0 to 600. | JSON string with these fields:<br>• `ok`<br>• `result`: `container`, `stopped`, `killed` (`true` if SIGKILL was necessary), `exit_code`, `status` | Stops a container and keeps it, with its files and logs. `provision_container` with the same settings starts it again. Stopping a container that is not running changes nothing. Wraps `teardown.stop()`. |
 | `destroy_container` | • `container` (str, required): container name or id.<br>• `force` (bool, default `False`): kill at once instead of a graceful stop (SIGTERM, then SIGKILL after 10 seconds). | JSON string with these fields:<br>• `ok`<br>• `result`: `container`, `stopped`, `killed`, `removed`, `exit_code` (the last exit code), `status` (`missing` after the removal) | Stops a container if it runs, then removes it and its anonymous volumes. The image and the mounted host directories stay. A container that does not exist is not an error (`removed: false`). Containers that the toolchain did not make are refused (`not_managed`). Wraps `teardown.destroy()`. |
 | `run_command_in_container` | • `container` (str, required): name or id of a running container (from `provision_container`).<br>• `command` (str, required): the shell command, for example `python --version`.<br>• `cwd` (str, default `/workspace`): working directory in the container.<br>• `timeout` (int, default 300): seconds before the command is stopped. | JSON string (`ExecResult`) with these fields:<br>• `ok`: `true` if `exit_code` is 0 and the command did not time out<br>• `command`, `exit_code`, `stdout`, `stderr`, `duration` (seconds), `timed_out`, `error` | Runs a command in a provisioned container through `docker exec` and returns a structured result. The generic execution primitive for the downstream teams, and the agent's smoke-test tool. Wraps `execute_in_container()`. |
-| `meow`, `woof` | None. | The fixed string `Meow` or `Woof`. | Placeholders from the first scaffold. They can be removed. |
 
 The lifecycle tools return JSON and never raise:
 
@@ -263,20 +326,31 @@ Examples: dependency detection and log parsing.
 TML-DockerToolchain/
 ├── .gitignore
 ├── .python-version
+├── Dockerfile         a hand-made Dockerfile (PR #8)
 ├── README.md
 ├── main.py
 ├── pyproject.toml
 ├── uv.lock
 ├── src/
 │   ├── __init__.py
-│   ├── agent.py
-│   ├── llm.py
+│   ├── agent.py       the agent and its system prompt
+│   ├── fs_backend.py  read-only real-disk backend for the agent's file tools
+│   ├── llm.py         the chat model, rate limit and retries
 │   ├── main.py
 │   ├── tools.py
 │   ├── repo/          inspection (sections A to D)
 │   ├── docker/        dockerization
 │   ├── lifecycle/     container lifecycle
 │   └── execution/     container execution
+├── scripts/
+│   ├── smoke_test.py  LLM and agent checks
+│   ├── run_agent.py   run the agent and print every step
+│   └── evaluate.py    score the pipeline against references/
+├── references/        hand-made reference Dockerfiles and smoke tests
+│   ├── repos.txt      the four repositories and their pinned commits
+│   ├── run.sh         build and smoke-test a reference
+│   └── ipmix/ ffb/ ep_bnp/ uap/
+├── runs/              generated Dockerfiles, build logs, evaluation results (Git ignores it)
 └── tests/
 ```
 
@@ -347,6 +421,8 @@ Repository → Dockerfile → successful image build → container starts → ar
 
 ## Next Steps
 
-- **Write smoke tests for container validation.**
-- **Implement the first set of toolchains for repository inspection.**
-- **Share the Claude chat link for review.**
+- **Run the full agent on the four reference repositories** (`scripts/evaluate.py --agent`) and record the results.
+- **Test the CUDA builds on a GPU host (RCAC):** IPMix training, the EP/BNP defenses and the FFB HSIC / PR methods call `.cuda()` directly and cannot run on CPU.
+- **A CUDA base-image template** (`nvidia/cuda:<ver>-devel`) for repositories that compile CUDA code.
+- **Prefer the repository's own Dockerfile** when it has one (the agent is told to try it first; the template still ignores it).
+- **Apptainer / SIF** conversion for RCAC.
