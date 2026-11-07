@@ -11,7 +11,8 @@ For each repository in references/repos.txt:
        python   Python major.minor, same as the reference image?
        torch    torch / torchvision versions (without +cpu / +cuNNN), same as the reference?
        smoke    does references/<name>/smoke.py pass in the pipeline's image (no network)?
-  4. write runs/eval/results.md and runs/eval/results.json.
+  4. add the rows to runs/eval/results.json (one row per repository and mode: a new run replaces
+     that row and keeps the others) and write runs/eval/results.md from all rows.
 
 The reference images (tml-ref/<name>:latest) come from references/run.sh. Without them, the
 python / torch columns show the pipeline's versions only.
@@ -22,6 +23,7 @@ Usage:
     uv run python -m scripts.evaluate --agent ffb        # full agent on FFB
     uv run python -m scripts.evaluate --skip-build ffb   # re-score the image built last time
     uv run python -m scripts.evaluate --clean            # remove the images it made at the end
+    uv run python -m scripts.evaluate --fresh            # forget earlier results first
 """
 
 from __future__ import annotations
@@ -228,12 +230,27 @@ def report(results: list[Result]) -> str:
     return "\n".join(rows) + f"\n\n**{passed} of {len(results)}** pipeline images pass the reference smoke test.\n"
 
 
+def merge(new: list[Result], path: Path) -> list[Result]:
+    """Earlier rows from `path`, with each (name, mode) row of `new` replacing its old row."""
+    old: list[Result] = []
+    try:
+        for row in json.loads(path.read_text()):
+            old.append(Result(**{k: v for k, v in row.items() if k in Result.__dataclass_fields__}))
+    except (OSError, ValueError, TypeError):
+        pass
+    replaced = {(r.name, r.mode) for r in new}
+    kept = [r for r in old if (r.name, r.mode) not in replaced]
+    order = {n: i for i, n in enumerate(read_repos())}
+    return sorted(kept + new, key=lambda r: (r.mode, order.get(r.name, 99)))
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("names", nargs="*", help="repositories from references/repos.txt (default: all)")
     p.add_argument("--agent", action="store_true", help="run the full agent instead of the template step")
     p.add_argument("--skip-build", action="store_true", help="score the image an earlier run built")
     p.add_argument("--clean", action="store_true", help="remove the pipeline images at the end")
+    p.add_argument("--fresh", action="store_true", help="forget the results of earlier runs")
     args = p.parse_args(argv)
 
     repos = read_repos()
@@ -246,11 +263,14 @@ def main(argv: list[str] | None = None) -> int:
     results = [evaluate_one(n, *repos[n], mode=mode, skip_build=args.skip_build) for n in names]
 
     OUT.mkdir(parents=True, exist_ok=True)
-    table = report(results)
+    rows = merge(results, Path("/nonexistent") if args.fresh else OUT / "results.json")
+    table = report(rows)
     stamp = time.strftime("%Y-%m-%d %H:%M")
-    (OUT / "results.md").write_text(f"# Pipeline vs reference ({mode} mode, {stamp})\n\n{table}")
-    (OUT / "results.json").write_text(json.dumps([asdict(r) for r in results], indent=1))
-    print("\n" + table)
+    (OUT / "results.md").write_text(f"# Pipeline vs reference (updated {stamp})\n\n{table}")
+    (OUT / "results.json").write_text(json.dumps([asdict(r) for r in rows], indent=1))
+    print("\nthis run:\n" + report(results))
+    if len(rows) > len(results):
+        print("all results so far:\n" + table)
     print(f"saved: {OUT / 'results.md'}, {OUT / 'results.json'}")
 
     if args.clean:

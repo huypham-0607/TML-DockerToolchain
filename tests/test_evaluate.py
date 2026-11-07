@@ -167,3 +167,24 @@ class TestLiveProbes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMerge(unittest.TestCase):
+    """Running one repository at a time must not erase the others (Sat 7 Nov: only UAP survived)."""
+
+    def test_new_rows_replace_their_old_row_and_keep_the_rest(self):
+        import json
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / "results.json"
+            first = [ev.Result("ffb", "agent", built=True, smoke_passed=False), ev.Result("ep_bnp", "agent", built=True, smoke_passed=True)]
+            path.write_text(json.dumps([vars(r) for r in first]))
+            rows = ev.merge([ev.Result("ffb", "agent", built=True, smoke_passed=True), ev.Result("uap", "template")], path)
+        names = [(r.name, r.mode, r.smoke_passed) for r in rows]
+        self.assertEqual(names, [("ffb", "agent", True), ("ep_bnp", "agent", True), ("uap", "template", None)])
+
+    def test_missing_or_broken_file_starts_empty(self):
+        with tempfile.TemporaryDirectory() as t:
+            bad = Path(t) / "results.json"
+            bad.write_text("{not json")
+            self.assertEqual([r.name for r in ev.merge([ev.Result("ffb", "agent")], bad)], ["ffb"])
+            self.assertEqual([r.name for r in ev.merge([ev.Result("ffb", "agent")], Path(t) / "none.json")], ["ffb"])
