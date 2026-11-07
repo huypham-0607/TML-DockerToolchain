@@ -63,6 +63,7 @@ class RepoProfile:
             },
             "frameworks": env.frameworks,
             "third_party_imports": env.imports[:max_items],
+            "imports_itself_as": env.self_package,
             "gpu": {
                 "uses_cuda": env.gpu.uses_cuda,
                 "gpu_required": env.gpu.gpu_required,

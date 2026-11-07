@@ -96,6 +96,60 @@ def fix_companions(torch_pins: list[str]) -> tuple[list[str], list[str]]:
     return [f"{n}=={v}" if v else n for n, v in pins.items()], notes
 
 
+# Standard-library modules that need an OS package on python:<ver>-slim (Debian) images
+STDLIB_OS_PACKAGES = {"tkinter": "libtk8.6", "_tkinter": "libtk8.6", "turtle": "libtk8.6"}
+
+# Two pip packages that install the same top-level module: the second one listed is dropped
+# (the first is what the code means). `art` (ASCII art) and the Adversarial Robustness Toolbox
+# both install `art`; code that pins both means the toolbox (UAP).
+MODULE_CLASHES = [("adversarial-robustness-toolbox", "art")]
+
+# A requirements line that needs the repository's files (includes, editable or local installs):
+# such a file is installed after COPY . instead of before it
+NEEDS_SOURCE_RE = re.compile(r"^\s*(-r|--requirement|-c|--constraint|-e|--editable|\.|/|file:)", re.I)
+
+
+def _vkey(v: str | None) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:4])
+
+
+def clean_requirements(text: str) -> tuple[list[str] | None, list[str]]:
+    """Removes duplicate pins of one package (keeps the highest version) and the second package
+    of a MODULE_CLASHES pair. Returns (the cleaned lines, notes), or (None, []) if nothing changed.
+
+    pip refuses a file that pins one package twice with different versions (UAP: Pillow==10.1.0 and
+    Pillow==10.2.0), so the whole install fails.
+    """
+    from ..repo.dependencies import parse_requirement
+
+    lines = text.splitlines()
+    by_name: dict[str, list[tuple[int, str | None]]] = {}
+    for i, line in enumerate(lines):
+        dep = parse_requirement(line)
+        if dep and not dep.url:
+            by_name.setdefault(_norm(dep.name), []).append((i, dep.version))
+    drop: set[int] = set()
+    notes: list[str] = []
+    for name, entries in by_name.items():
+        if len(entries) > 1:
+            keep = max(entries, key=lambda e: (_vkey(e[1]), e[0]))
+            drop |= {i for i, _ in entries if i != keep[0]}
+            versions = ", ".join(v or "any" for _, v in entries)
+            notes.append(f"{name} is listed {len(entries)} times ({versions}): kept {keep[1] or 'the last one'}")
+    for first, second in MODULE_CLASHES:
+        if first in by_name and second in by_name:
+            drop |= {i for i, _ in by_name[second]}
+            notes.append(f"{first} and {second} both install the module `{second.replace('-', '_')}`: "
+                         f"dropped {second}, kept {first}")
+    if not drop:
+        return None, []
+    return [line for i, line in enumerate(lines) if i not in drop], notes
+
+
+def _sh_quote(text: str) -> str:
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
 def _old_torch(torch_pins: list[str]) -> bool:
     """True if torch is pinned below 2.3: those builds break with numpy 2."""
     for pin in torch_pins:
@@ -203,10 +257,21 @@ def generate_dockerfile(repo_path: str | Path, torch_build: str | None = None) -
     reqs = [f for f in deps.files if Path(f).name == "requirements.txt"]
     installable = (root / "setup.py").is_file() or (root / "pyproject.toml").is_file()
 
+    os_packages = ["build-essential", "git"]
+    for module in env.stdlib_imports:
+        if (pkg := STDLIB_OS_PACKAGES.get(module)) and pkg not in os_packages:
+            os_packages.append(pkg)
+            notes.append(f"the code imports {module}, which needs {pkg} on a slim image: added to apt-get")
+    env_vars = "PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DEBIAN_FRONTEND=noninteractive"
+    if "wandb" in env.imports:
+        env_vars += " WANDB_MODE=disabled"
+        notes.append("the code uses wandb: WANDB_MODE=disabled so that scripts run without a wandb login "
+                     "(set WANDB_MODE=online at run time to log)")
+
     lines = [
         f"FROM python:{py}-slim",
-        "ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DEBIAN_FRONTEND=noninteractive",
-        "RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \\",
+        f"ENV {env_vars}",
+        f"RUN apt-get update && apt-get install -y --no-install-recommends {' '.join(os_packages)} \\",
         "    && rm -rf /var/lib/apt/lists/*",
         "WORKDIR /workspace",
     ]
@@ -239,22 +304,54 @@ def generate_dockerfile(repo_path: str | Path, torch_build: str | None = None) -
     if other_pins:
         lines.append("RUN pip install " + " ".join(f'"{p}"' for p in other_pins))
 
-    lines.append("COPY . /workspace")
+    # Requirements files are installed BEFORE the repository is copied in, when they do not refer to
+    # its files: then a rebuild after a change to a later line reuses the cached install layers.
+    constraint = f" -c {TORCH_CONSTRAINTS}" if torch_pins else ""
+    early, late = [], []
     for i, r in enumerate(reqs):
-        if torch_pins:
-            filtered = f"/tmp/requirements-{i}.txt"
-            lines.append(f"RUN grep -viE '{TORCH_LINE_RE}' {r} > {filtered}; pip install -r {filtered} -c {TORCH_CONSTRAINTS}")
+        try:
+            text = (root / r).read_text(errors="replace")
+        except OSError:
+            text = ""
+        cleaned, clean_notes = clean_requirements(text)
+        notes += [f"{r}: {n}" for n in clean_notes]
+        source = f"/tmp/requirements-src-{i}.txt"
+        if cleaned is not None:
+            # write the cleaned file into the image (it is shown here, so it can be reviewed and edited)
+            get = "RUN printf '%s\\n' " + " ".join(_sh_quote(x) for x in cleaned if x.strip()) + f" > {source}"
         else:
-            lines.append(f"RUN pip install -r {r}")
-    if installable:
-        lines.append("RUN pip install -e .")
+            get = f"COPY {r} {source}"
+        filtered = f"/tmp/requirements-{i}.txt"
+        if torch_pins:
+            install = f"RUN grep -viE '{TORCH_LINE_RE}' {source} > {filtered}; pip install -r {filtered}{constraint}"
+        else:
+            install = f"RUN pip install -r {source}"
+        needs_source = any(NEEDS_SOURCE_RE.match(x) for x in (cleaned or text.splitlines()))
+        if needs_source:
+            # includes and local paths resolve against the repository: install from its own copy
+            late.append(install.replace(source, r) if cleaned is None else install)
+        else:
+            early += [get, install]
+    lines += early
     if guessed:
         # one at a time and never fatal: a wrong guess must not break the build
         names = " ".join(guessed)
-        keep = f" -c {TORCH_CONSTRAINTS}" if torch_pins else ""
-        lines.append(f'RUN for p in {names}; do pip install "$p"{keep} || echo "could not install $p (guessed from imports)"; done')
+        lines.append(f'RUN for p in {names}; do pip install "$p"{constraint} || echo "could not install $p (guessed from imports)"; done')
         notes.append(f"installed from imports that no dependency file declares (unpinned, best effort): {names}. "
                      "Pin them, or remove any that are not real dependencies")
+    if env.self_package:
+        # the code imports the repository as a package (UAP: from uap.train.model_structure import ...):
+        # it must sit in a directory of that name, with its parent (and itself, for top-level imports
+        # from subfolders) on PYTHONPATH
+        pkg_dir = f"/workspace/{env.self_package}"
+        lines += [f"COPY . {pkg_dir}", f"WORKDIR {pkg_dir}", f"ENV PYTHONPATH=/workspace:{pkg_dir}"]
+        notes.append(f"the code imports the repository itself as the package `{env.self_package}`: copied to "
+                     f"{pkg_dir}, with /workspace and {pkg_dir} on PYTHONPATH")
+    else:
+        lines.append("COPY . /workspace")
+    lines += late
+    if installable:
+        lines.append("RUN pip install -e .")
     lines.append('CMD ["bash"]')
 
     gpu = env.gpu

@@ -37,10 +37,10 @@ FIELDS = ("python", "cuda", "cudnn", "torch", "tensorflow", "jax")
 # Python versions we would consider picking, newest first
 PYTHON_CANDIDATES = ["3.13", "3.12", "3.11", "3.10", "3.9", "3.8", "3.7", "3.6", "2.7"]
 
-# Picked when only lower bounds are known (for example "syntax needs Python >= 3.6"), instead of the
-# newest Python: research code
-# and its pinned packages are rarely ready for the newest Python, and 3.10 has the widest support
-# among PyTorch / TensorFlow releases.
+# Picked when no version is stated, if the constraints allow it, instead of the newest allowed Python:
+# research code and its pinned packages are rarely ready for the newest Python. 3.10 has the widest
+# support among PyTorch / TensorFlow releases and their pinned dependencies. Seen on UAP: torch 2.2
+# allows up to 3.12, but its numpy==1.24.3 pin has no 3.12 wheel, so pip tried to compile numpy and failed.
 PYTHON_FALLBACK = "3.10"
 
 # torch major.minor -> (default CUDA of the pip wheel, min python, max python)
@@ -140,6 +140,8 @@ class EnvironmentReport:
     evidence: list[Evidence]
     notes: list[str] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)   # third-party top-level modules the code imports
+    stdlib_imports: list[str] = field(default_factory=list)   # standard-library modules (some need OS packages: tkinter)
+    self_package: str | None = None   # the code imports the repository itself under this name (UAP: `uap`)
 
     def summary(self) -> dict[str, str | None]:
         return {k: v.value for k, v in self.resolved.items()}
@@ -421,7 +423,9 @@ def _collect_code(root: Path) -> tuple[list[Evidence], set[str], GPUUsage]:
     elif min_py:
         ev.append(Evidence("python", None, f">={min_py[0]}", min_py[1], "code",
                            f"syntax needs Python >= {min_py[0]}"))
-    return ev, imported - local, gpu
+    # `from uap.train.x import y` in a repository cloned as uap/ (or UAP/): it expects to be a package
+    self_package = next((m for m in sorted(imported) if m.lower() == root.name.lower()), None)
+    return ev, imported - local, gpu, self_package
 
 
 def _inferred(evidence: list[Evidence]) -> list[Evidence]:
@@ -478,10 +482,8 @@ def _resolve(fld: str, evidence: list[Evidence]) -> Resolved:
         )
 
     if fld == "python" and constraints:
-        # nothing concrete. Only lower bounds (">=3.6" from syntax): the fallback, if allowed.
-        # An upper bound (a framework's supported range) makes the newest allowed version a safe pick.
-        only_lower = all(part.strip().startswith(">") for c in constraints for part in c.split(","))
-        if only_lower and all(satisfies(PYTHON_FALLBACK, c) for c in constraints):
+        # nothing concrete: the fallback if every constraint allows it, else the newest Python allowed
+        if all(satisfies(PYTHON_FALLBACK, c) for c in constraints):
             return Resolved(value=PYTHON_FALLBACK, confidence=0.4, constraints=constraints,
                             sources=[f"no version given; {PYTHON_FALLBACK} satisfies the constraints"])
         for cand in PYTHON_CANDIDATES:
@@ -519,7 +521,7 @@ def detect_environment(
             evidence += _from_base_image(image, df.path)
     evidence += _collect_config(root, deps)
     evidence += _collect_docs(root, docs)
-    code_ev, imported, gpu = _collect_code(root)
+    code_ev, imported, gpu, self_package = _collect_code(root)
     evidence += code_ev
     evidence += _inferred(evidence)
     for e in evidence:
@@ -531,6 +533,7 @@ def detect_environment(
     ]
 
     third_party = sorted(m for m in imported if m and m not in sys.stdlib_module_names and not m.startswith("_"))
+    stdlib = sorted(m for m in imported if m in sys.stdlib_module_names)
 
     resolved = {fld: _resolve(fld, evidence) for fld in FIELDS}
     # only report framework versions for frameworks that are actually used
@@ -556,7 +559,7 @@ def detect_environment(
 
     return EnvironmentReport(
         root=str(root), frameworks=frameworks, resolved=resolved, gpu=gpu, evidence=evidence, notes=notes,
-        imports=third_party,
+        imports=third_party, stdlib_imports=stdlib, self_package=self_package,
     )
 
 
