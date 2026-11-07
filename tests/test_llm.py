@@ -139,15 +139,13 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def test_leaked_chat_format_tokens_are_cut_from_tool_names():
-    from langchain_core.messages import AIMessage
-    from langchain_core.outputs import ChatGeneration, ChatResult
-    from src.llm import clean_tool_name, fix_tool_names
 
-    assert clean_tool_name("container_status<|channel|>commentary") == "container_status"
-    assert clean_tool_name("build_image") == "build_image"
-    msg = AIMessage(content="", tool_calls=[
-        {"name": "container_status<|channel|>commentary", "args": {"container": ""}, "id": "1"},
-        {"name": "ls", "args": {"path": "/"}, "id": "2"}])
-    fixed = fix_tool_names(ChatResult(generations=[ChatGeneration(message=msg)]))
-    assert [c["name"] for c in fixed.generations[0].message.tool_calls] == ["container_status", "ls"]
+class TestToolNames(unittest.TestCase):
+    def test_leaked_chat_format_tokens_are_cut_from_tool_names(self):
+        self.assertEqual(llm.clean_tool_name("container_status<|channel|>commentary"), "container_status")
+        self.assertEqual(llm.clean_tool_name("build_image"), "build_image")
+        msg = AIMessage(content="", tool_calls=[
+            {"name": "container_status<|channel|>commentary", "args": {"container": ""}, "id": "1"},
+            {"name": "ls", "args": {"path": "/"}, "id": "2"}])
+        fixed = llm.fix_tool_names(ChatResult(generations=[ChatGeneration(message=msg)]))
+        self.assertEqual([c["name"] for c in fixed.generations[0].message.tool_calls], ["container_status", "ls"])
