@@ -96,6 +96,7 @@ The toolchain changes a research repository into a validated Docker environment.
 | `LLM_REQUESTS_PER_MINUTE` | No | Client-side request limit. Default: 18 for `rcac` (Purdue GenAI allows 20 per minute per user), 120 for `openai`. |
 | `LLM_RATE_RETRIES` | No | How often a refused request ("Rate limit exceeded") is retried, waiting 15 s, 30 s, then 60 s. Default 6. |
 | `TML_STEP_LIMIT` | No | The agent's step limit (LangGraph recursion limit, 2 steps per agent round). Default 150. |
+| `TML_MAX_COMMAND_SECONDS` | No | The longest one `run_command_in_container` call from the agent may run. Default 300. Longer requests are cut to this. |
 | `TML_TORCH_BUILD` | No | `cpu`, `cuda` or `auto` (default): which PyTorch build `generate_dockerfile` installs. `auto` uses the CUDA build only if Docker on this machine can attach an NVIDIA GPU. |
 
 > **Caution:** Do not commit `.env`. Git ignores this file.
@@ -147,7 +148,7 @@ All four toolchains are implemented and connected to the agent in `src/agent.py`
 | Toolchain | Package | State |
 | --- | --- | --- |
 | Repository inspection | `src/repo/` | Sections A to D, combined by `inspect.py` |
-| Dockerization | `src/docker/` | One `python:<ver>-slim` template (`generate.py`): PyTorch from the PyTorch index (CPU or CUDA build), `+cuNNN` pins, matched torchvision / torchaudio, packages imported but not declared. A `docker build` wrapper (`build.py`). |
+| Dockerization | `src/docker/` | One `python:<ver>-slim` template (`generate.py`): PyTorch from the PyTorch index (CPU or CUDA build), `+cuNNN` pins, matched torchvision / torchaudio, packages imported but not declared, duplicate pins removed, OS packages for `tkinter`, `WANDB_MODE=disabled` for wandb, a package layout for repositories that import themselves. A `docker build` wrapper (`build.py`). |
 | Container lifecycle | `src/lifecycle/` | Provision, status, logs, diagnosis with hints, stop, destroy |
 | Container execution | `src/execution/` | `docker exec` with structured results and a timeout |
 
@@ -230,7 +231,8 @@ These parts of the design are not in the repository at this time:
 
    ```bash
    uv run python -m scripts.evaluate                 # template step only: no LLM, no API key
-   uv run python -m scripts.evaluate --agent ffb     # the full agent on one repository (10 to 40 minutes)
+   uv run python -m scripts.evaluate --agent ffb     # the full agent on one repository (about 2 minutes)
+   uv run python -m scripts.evaluate --agent --model qwen3.6:27b ffb   # the same tools, another LLM
    ```
 
 For each repository, `scripts/evaluate.py` clones it at the pinned commit (`references/repos.txt`), lets the pipeline build an image, and reports:
@@ -241,7 +243,9 @@ For each repository, `scripts/evaluate.py` clones it at the pinned commit (`refe
 | Python, torch, torchvision | The versions in the pipeline's image, and whether they match the reference image. |
 | Smoke test | The reference `smoke.py` passes in the pipeline's image. |
 
-The table is saved to `runs/eval/results.md` and `runs/eval/results.json`. The agent's transcript for each repository is saved to `runs/eval/<name>-agent.log`.
+The table is saved to `runs/eval/results.md` and `runs/eval/results.json`. Each run adds or replaces one row per repository, mode and model, and keeps the other rows, so repositories and models can be run one at a time (`--fresh` starts over). `--skip-build` scores the image that an earlier run built, without running the pipeline again. The agent's transcript is saved to `runs/eval/<name>-agent-<model>.log`.
+
+**Other agents.** `--model` drives the same tools with another LLM (it sets `LLM_MODEL`), and `--provider openai` with OpenAI instead of RCAC (it sets `LLM_PROVIDER`; needs `OPENAI_API_KEY`). Each model gets its own rows, labelled for example `agent (qwen3.6:27b)`, so the table compares models. RCAC lists the models your key can use at `https://genai.rcac.purdue.edu/api/models`.
 
 ## Agent Toolchain Categories
 
@@ -269,7 +273,7 @@ Keep the main LLM-facing tools high-level. The agent (`src/agent.py`) has these 
 | `diagnose_container` | • `container` (str, required): container name or id. | JSON string with these fields:<br>• `ok`<br>• `diagnosis`: `status`, `logs` (the last 60 lines of each stream), `hints` (each with `code`, `evidence`, `suggestion`, `owner`), `processes` and `resources` (CPU, memory, process count; running containers only), `events`, `notes` | Explains the state of a container. Use it when a container is not healthy or a command behaved strangely. The hints are deterministic labels of known failure patterns (for example `out_of_memory`, `missing_python_module`, `gpu_unavailable`); the LLM makes the repair decision. No hints means no known pattern: read the logs. A missing container gives health `missing`. Wraps `diagnose()`. |
 | `stop_container` | • `container` (str, required): container name or id.<br>• `timeout` (int, default 10): seconds to wait after SIGTERM before SIGKILL, 0 to 600. | JSON string with these fields:<br>• `ok`<br>• `result`: `container`, `stopped`, `killed` (`true` if SIGKILL was necessary), `exit_code`, `status` | Stops a container and keeps it, with its files and logs. `provision_container` with the same settings starts it again. Stopping a container that is not running changes nothing. Wraps `teardown.stop()`. |
 | `destroy_container` | • `container` (str, required): container name or id.<br>• `force` (bool, default `False`): kill at once instead of a graceful stop (SIGTERM, then SIGKILL after 10 seconds). | JSON string with these fields:<br>• `ok`<br>• `result`: `container`, `stopped`, `killed`, `removed`, `exit_code` (the last exit code), `status` (`missing` after the removal) | Stops a container if it runs, then removes it and its anonymous volumes. The image and the mounted host directories stay. A container that does not exist is not an error (`removed: false`). Containers that the toolchain did not make are refused (`not_managed`). Wraps `teardown.destroy()`. |
-| `run_command_in_container` | • `container` (str, required): name or id of a running container (from `provision_container`).<br>• `command` (str, required): the shell command, for example `python --version`.<br>• `cwd` (str, default `/workspace`): working directory in the container.<br>• `timeout` (int, default 300): seconds before the command is stopped. | JSON string (`ExecResult`) with these fields:<br>• `ok`: `true` if `exit_code` is 0 and the command did not time out<br>• `command`, `exit_code`, `stdout`, `stderr`, `duration` (seconds), `timed_out`, `error` | Runs a command in a provisioned container through `docker exec` and returns a structured result. The generic execution primitive for the downstream teams, and the agent's smoke-test tool. Wraps `execute_in_container()`. |
+| `run_command_in_container` | • `container` (str, required): name or id of a running container (from `provision_container`). The reply gets a `warning` when the container runs an older build of its image (the image was rebuilt after the container started).<br>• `command` (str, required): the shell command, for example `python --version`.<br>• `cwd` (str, default `/workspace`): working directory in the container.<br>• `timeout` (int, default 300): seconds before the command is stopped; at most `TML_MAX_COMMAND_SECONDS` (300). | JSON string (`ExecResult`) with these fields:<br>• `ok`: `true` if `exit_code` is 0 and the command did not time out<br>• `command`, `exit_code`, `stdout`, `stderr`, `duration` (seconds), `timed_out`, `error`<br>• `hint`, after a timeout: do not run it again; test with a small input instead<br>Progress bars (`\r` updates) are collapsed to their last state, and long output keeps its head and tail. | Runs a command in a provisioned container through `docker exec` and returns a structured result. The generic execution primitive for the downstream teams, and the agent's smoke-test tool. Wraps `execute_in_container()`. |
 
 The lifecycle tools return JSON and never raise:
 

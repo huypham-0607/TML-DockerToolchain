@@ -116,6 +116,18 @@ class TestEvaluateOne(unittest.TestCase):
             r = ev.evaluate_one("ffb", "u", "0" * 40, mode="template", skip_build=False)
         self.assertIn("pipeline error: RuntimeError: boom", r.build_note)
 
+    def test_docker_down_is_a_clear_error_not_missing_images(self):
+        import io
+        from contextlib import redirect_stderr
+        down = subprocess.CompletedProcess(["docker", "info"], 1, "", "Cannot connect to the Docker daemon")
+        err = io.StringIO()
+        with mock.patch.object(ev.subprocess, "run", return_value=down), redirect_stderr(err), \
+                mock.patch.object(ev, "evaluate_one") as one:
+            code = ev.main(["--agent", "--skip-build"])
+        self.assertEqual(code, 2)
+        self.assertIn("Docker is not reachable", err.getvalue())
+        one.assert_not_called()
+
     def test_unknown_name_is_a_usage_error(self):
         with self.assertRaises(SystemExit):
             ev.main(["nope"])
@@ -167,3 +179,67 @@ class TestLiveProbes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMerge(unittest.TestCase):
+    """Running one repository at a time must not erase the others (Sat 7 Nov: only UAP survived)."""
+
+    def test_new_rows_replace_their_old_row_and_keep_the_rest(self):
+        import json
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / "results.json"
+            first = [ev.Result("ffb", "agent", built=True, smoke_passed=False), ev.Result("ep_bnp", "agent", built=True, smoke_passed=True)]
+            path.write_text(json.dumps([vars(r) for r in first]))
+            rows = ev.merge([ev.Result("ffb", "agent", built=True, smoke_passed=True), ev.Result("uap", "template")], path)
+        names = [(r.name, r.mode, r.smoke_passed) for r in rows]
+        self.assertEqual(names, [("ffb", "agent", True), ("ep_bnp", "agent", True), ("uap", "template", None)])
+
+    def test_missing_or_broken_file_starts_empty(self):
+        with tempfile.TemporaryDirectory() as t:
+            bad = Path(t) / "results.json"
+            bad.write_text("{not json")
+            self.assertEqual([r.name for r in ev.merge([ev.Result("ffb", "agent")], bad)], ["ffb"])
+            self.assertEqual([r.name for r in ev.merge([ev.Result("ffb", "agent")], Path(t) / "none.json")], ["ffb"])
+
+
+class TestOtherModels(unittest.TestCase):
+    """Testing "with other agents": the same tools driven by another LLM keep their own rows."""
+
+    def test_rows_of_two_models_are_kept_apart(self):
+        import json
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / "results.json"
+            path.write_text(json.dumps([
+                {"name": "ffb", "mode": "agent", "built": True, "smoke_passed": True},  # before the model column
+                {"name": "ffb", "mode": "template", "built": True},
+            ]))
+            rows = ev.merge([ev.Result("ffb", "agent", built=True, smoke_passed=False, model="qwen3.6:27b")], path)
+        got = {(r.mode, r.model): r.smoke_passed for r in rows}
+        self.assertEqual(got[("agent", ev.LEGACY_AGENT_MODEL)], True)
+        self.assertEqual(got[("agent", "qwen3.6:27b")], False)
+        self.assertIn(("template", ""), got)
+        table = ev.report(rows)
+        self.assertIn("| ffb | agent (qwen3.6:27b) |", table)
+        self.assertIn("| ffb | agent (gpt-oss:120b) |", table)
+
+    def test_current_model_follows_the_environment(self):
+        with mock.patch.dict("os.environ", {"LLM_PROVIDER": "rcac", "LLM_MODEL": "gemma4:26b-a4b"}):
+            self.assertEqual(ev.current_model(), "gemma4:26b-a4b")
+        with mock.patch.dict("os.environ", {"LLM_PROVIDER": "openai", "LLM_MODEL": ""}):
+            self.assertEqual(ev.current_model(), "gpt-5-mini")
+
+    def test_model_flag_needs_agent_mode(self):
+        import io
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ev.main(["--model", "qwen3.6:27b", "ffb"])
+
+    def test_model_flag_sets_the_environment(self):
+        with mock.patch.dict("os.environ", {}, clear=False), \
+                mock.patch.object(ev.subprocess, "run", return_value=mock.Mock(returncode=1)):
+            import io
+            from contextlib import redirect_stderr
+            with redirect_stderr(io.StringIO()):
+                ev.main(["--agent", "--model", "qwen3.6:27b", "ffb"])
+            import os
+            self.assertEqual(os.environ["LLM_MODEL"], "qwen3.6:27b")

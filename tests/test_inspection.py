@@ -253,8 +253,9 @@ class TestEnvironment(unittest.TestCase):
             # docker (0.95) beats requirements (0.9) and both are strong -> conflict
             self.assertEqual(r.summary()["torch"], "2.1.0")
             self.assertTrue(r.resolved["torch"].conflict)
-            # python not stated anywhere: newest version allowed by torch 2.0/2.1 ranges
-            self.assertEqual(r.summary()["python"], "3.11")
+            # python not stated anywhere: 3.10, which the torch 2.0/2.1 ranges allow (the newest allowed,
+            # 3.11, was the rule before; it broke pinned packages without wheels for new Pythons, see UAP)
+            self.assertEqual(r.summary()["python"], "3.10")
 
     def test_tensorflow_inference_and_cpu_only(self):
         with tempfile.TemporaryDirectory() as t:
@@ -264,7 +265,7 @@ class TestEnvironment(unittest.TestCase):
             self.assertEqual(r.summary()["tensorflow"], "2.13.0")
             self.assertIsNone(r.summary()["cuda"])  # no CUDA usage -> CPU is fine
             self.assertEqual(r.resolved["cuda"].alternatives, {"11.8": 0.3})
-            self.assertEqual(r.summary()["python"], "3.11")
+            self.assertEqual(r.summary()["python"], "3.10")   # allowed by tensorflow 2.13 (3.8 to 3.11)
 
     def test_old_torch_inference(self):
         with tempfile.TemporaryDirectory() as t:
@@ -328,6 +329,19 @@ class TestImportsAndFallback(unittest.TestCase):
             imports = detect_environment(root).imports
         self.assertEqual(imports, ["PIL", "numpy", "torch"])
 
+    def test_upper_bound_still_picks_310(self):
+        # UAP: torch==2.2.0 allows Python 3.8 to 3.12; 3.12 broke numpy==1.24.3 (no wheel)
+        with tempfile.TemporaryDirectory() as t:
+            make_repo(Path(t), {"requirements.txt": "torch==2.2.0\nnumpy==1.24.3\n", "a.py": "import torch\n"})
+            self.assertEqual(detect_environment(t).resolved["python"].value, "3.10")
+
+    def test_stdlib_imports_are_recorded(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_repo(Path(t), {"dataset.py": "from tkinter import S\nimport os\nimport numpy\n"})
+            r = detect_environment(t)
+        self.assertEqual(r.stdlib_imports, ["os", "tkinter"])
+        self.assertEqual(r.imports, ["numpy"])
+
     def test_lower_bound_only_picks_310(self):
         with tempfile.TemporaryDirectory() as t:
             make_repo(Path(t), {"a.py": "x = 1\nprint(f'{x}')\n"})
@@ -350,3 +364,18 @@ class TestImportsAndFallback(unittest.TestCase):
                 warnings.simplefilter("always")
                 detect_environment(t)
         self.assertFalse([w for w in caught if issubclass(w.category, SyntaxWarning)])
+
+
+class TestSelfPackage(unittest.TestCase):
+    def test_repo_importing_itself(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t) / "UAP"            # cloned as UAP/, imported as uap
+            make_repo(root, {"main.py": "from uap.train.model import get\n", "train/model.py": "x = 1\n"})
+            env = detect_environment(root)
+        self.assertEqual(env.self_package, "uap")
+        self.assertNotIn("uap", env.imports)
+
+    def test_ordinary_repo(self):
+        with tempfile.TemporaryDirectory() as t:
+            make_repo(Path(t) / "ffb", {"src/a.py": "import utils\nimport numpy\n", "src/utils.py": ""})
+            self.assertIsNone(detect_environment(Path(t) / "ffb").self_package)

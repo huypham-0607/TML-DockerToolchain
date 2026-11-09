@@ -13,8 +13,9 @@
     (https://docs.rcac.purdue.edu/services/genai/api/). Two things keep a run going:
       - a client-side limiter, set to LLM_REQUESTS_PER_MINUTE (default: the provider's value);
       - retries with waiting when the server still refuses. RCAC answers a rate limit with HTTP 400
-        ("Rate limit exceeded"), not 429, so the OpenAI client's own retries never fire, and it may
-        answer with JSON null instead of an error. Both are retried LLM_RATE_RETRIES times (default 6),
+        ("Rate limit exceeded"), not 429, so the OpenAI client's own retries never fire; a busy backend
+        also comes as HTTP 400 ("Open WebUI: Server Connection Error"); and it may answer with JSON null
+        instead of an error. All of these are retried LLM_RATE_RETRIES times (default 6),
         waiting 15 s, 30 s, then 60 s between tries.
 """
 
@@ -52,10 +53,19 @@ DEFAULT_RATE_RETRIES = 6
 RETRY_WAITS = (15.0, 30.0, 60.0)   # seconds before retry 1, 2, and 3 onwards
 
 
+# Answers that mean "not now" rather than "wrong request". RCAC sends several of them as HTTP 400:
+# "Rate limit exceeded", and "Open WebUI: Server Connection Error" when its model backend is busy.
+RETRYABLE_TEXT = (
+    "rate limit", "too many requests", "error code: 429",
+    "server connection error", "temporarily unavailable", "service unavailable", "bad gateway",
+    "gateway timeout", "error code: 502", "error code: 503", "error code: 504",
+)
+
+
 def is_retryable(error: BaseException) -> bool:
-    """True for a refused-for-now answer: a rate limit, or the null body RCAC sends instead of an error."""
+    """True for a refused-for-now answer: a rate limit or a busy server, or the null body RCAC sends instead of an error."""
     text = str(error).lower()
-    if "rate limit" in text or "too many requests" in text or "error code: 429" in text:
+    if any(t in text for t in RETRYABLE_TEXT):
         return True
     # a JSON null body breaks response parsing with a NoneType error deep in the client
     return isinstance(error, (TypeError, AttributeError)) and "nonetype" in text
@@ -64,6 +74,25 @@ def is_retryable(error: BaseException) -> bool:
 def retry_wait(attempt: int) -> float:
     """Seconds to wait before retry number `attempt` (0-based)."""
     return RETRY_WAITS[min(attempt, len(RETRY_WAITS) - 1)]
+
+
+def clean_tool_name(name: str) -> str:
+    """gpt-oss sometimes leaks its chat-format tokens into a tool name, e.g.
+    'container_status<|channel|>commentary'. Keep the part before the first '<|'."""
+    return name.split("<|", 1)[0].strip() if name and "<|" in name else name
+
+
+def fix_tool_names(result):
+    """Clean the tool names of every tool call in a ChatResult, in place, and return it."""
+    for gen in getattr(result, "generations", []) or []:
+        msg = getattr(gen, "message", None)
+        for call in getattr(msg, "tool_calls", None) or []:
+            call["name"] = clean_tool_name(call.get("name", ""))
+        for call in (getattr(msg, "additional_kwargs", None) or {}).get("tool_calls", []) or []:
+            fn = call.get("function") or {}
+            if "name" in fn:
+                fn["name"] = clean_tool_name(fn["name"])
+    return result
 
 
 class RetryingChatOpenAI(ChatOpenAI):
@@ -81,7 +110,7 @@ class RetryingChatOpenAI(ChatOpenAI):
     def _generate(self, *args, **kwargs):
         for attempt in range(self.rate_limit_retries + 1):
             try:
-                return super()._generate(*args, **kwargs)
+                return fix_tool_names(super()._generate(*args, **kwargs))
             except Exception as e:  # noqa: BLE001 - re-raised unless it is a retryable refusal
                 if attempt == self.rate_limit_retries or not is_retryable(e):
                     raise
@@ -91,7 +120,7 @@ class RetryingChatOpenAI(ChatOpenAI):
     async def _agenerate(self, *args, **kwargs):
         for attempt in range(self.rate_limit_retries + 1):
             try:
-                return await super()._agenerate(*args, **kwargs)
+                return fix_tool_names(await super()._agenerate(*args, **kwargs))
             except Exception as e:  # noqa: BLE001
                 if attempt == self.rate_limit_retries or not is_retryable(e):
                     raise

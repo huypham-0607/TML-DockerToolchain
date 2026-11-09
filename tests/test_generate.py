@@ -53,8 +53,23 @@ class TestGenerateDockerfile(GenerateCase):
 
     def test_requirements_without_torch_are_installed_as_is(self):
         text, _, _ = self.gen("np", {"requirements.txt": "numpy==1.24.2\n", "a.py": "import numpy\n"})
-        self.assertIn("RUN pip install -r requirements.txt", text)
+        self.assertIn("COPY requirements.txt /tmp/requirements-src-0.txt\nRUN pip install -r /tmp/requirements-src-0.txt", text)
         self.assertNotIn("grep", text)
+
+    def test_requirements_are_installed_before_the_repo_is_copied(self):
+        # a rebuild after a change to a later line then reuses the cached install layers
+        text, _, _ = self.gen("order", {"requirements.txt": "numpy==1.24.2\n", "a.py": "import numpy, tqdm\n"})
+        lines = text.splitlines()
+        self.assertLess(lines.index("RUN pip install -r /tmp/requirements-src-0.txt"), lines.index("COPY . /workspace"))
+        guess = next(i for i, x in enumerate(lines) if x.startswith("RUN for p in"))
+        self.assertLess(guess, lines.index("COPY . /workspace"))
+
+    def test_requirements_that_need_the_repo_are_installed_after_copy(self):
+        text, _, _ = self.gen("local", {"requirements.txt": "-r base.txt\n-e .\n", "base.txt": "numpy\n",
+                                        "setup.py": "from setuptools import setup\nsetup(name='x')\n"})
+        lines = text.splitlines()
+        self.assertNotIn("COPY requirements.txt /tmp/requirements-src-0.txt", lines)
+        self.assertGreater(lines.index("RUN pip install -r requirements.txt"), lines.index("COPY . /workspace"))
 
 
 class TestTorchPins(GenerateCase):
@@ -90,7 +105,7 @@ class TestTorchPins(GenerateCase):
         text, _, _ = self.gen("ffb", {**self.FFB, "a.py": "import folktables\n"})
         lines = text.splitlines()
         freeze = next(i for i, x in enumerate(lines) if "pip freeze" in x)
-        req = next(i for i, x in enumerate(lines) if "requirements.txt > /tmp/requirements-0.txt" in x)
+        req = next(i for i, x in enumerate(lines) if "> /tmp/requirements-0.txt" in x)
         guess = next(i for i, x in enumerate(lines) if x.startswith("RUN for p in"))
         self.assertLess(freeze, req)
         self.assertIn(f"-c {generate.TORCH_CONSTRAINTS}", lines[req])     # torch lines filtered AND pinned
@@ -234,3 +249,73 @@ class TestTorchCompanions(GenerateCase):
     def test_new_torch_keeps_numpy_free(self):
         text, _, _ = self.gen("new", {"requirements.txt": "torch==2.4.0\n"})
         self.assertNotIn("numpy<2", text)
+
+
+class TestFixesFromTheAgentRuns(GenerateCase):
+    """What the agent had to find by hand in the FFB and UAP runs (Sat 7 Nov), now in the template."""
+
+    def test_tkinter_import_adds_libtk(self):
+        # FFB: src/dataset.py starts with `from tkinter import S`
+        text, _, notes = self.gen("tk", {"dataset.py": "from tkinter import S\nimport numpy\n"})
+        self.assertIn("--no-install-recommends build-essential git libtk8.6", text)
+        self.assertTrue(any("tkinter" in n for n in notes))
+
+    def test_no_tkinter_no_libtk(self):
+        text, _, _ = self.gen("notk", {"a.py": "import numpy\n"})
+        self.assertNotIn("libtk", text)
+
+    def test_wandb_runs_disabled(self):
+        text, _, notes = self.gen("wb", {"train.py": "import wandb\nwandb.init()\n"})
+        self.assertIn("WANDB_MODE=disabled", text.splitlines()[1])
+        self.assertTrue(any("wandb" in n for n in notes))
+
+    def test_duplicate_pins_and_module_clash_are_cleaned(self):
+        # UAP's requirements.txt, as published
+        uap = ("adversarial_robustness_toolbox==1.17.1\nart==6.1\nmatplotlib==3.7.5\nnumpy==1.24.3\n"
+               "Pillow==10.1.0\nPillow==10.2.0\nscikit_learn==1.3.2\nscikit_learn==1.3.0\n"
+               "torch==2.2.0\ntorchvision==0.16.0\ntqdm==4.66.1\n")
+        text, _, notes = self.gen("uapreq", {"requirements.txt": uap, "a.py": "import art, torch\n"})
+        line = next(x for x in text.splitlines() if x.startswith("RUN printf"))
+        self.assertIn("'Pillow==10.2.0'", line)
+        self.assertNotIn("Pillow==10.1.0", line)
+        self.assertIn("'scikit_learn==1.3.2'", line)
+        self.assertNotIn("scikit_learn==1.3.0", line)
+        self.assertNotIn("'art==6.1'", line)
+        self.assertIn("'adversarial_robustness_toolbox==1.17.1'", line)
+        self.assertTrue(any("pillow is listed 2 times" in n for n in notes))
+        self.assertTrue(any("both install the module `art`" in n for n in notes))
+
+    def test_clean_requirements_leaves_clean_files_alone(self):
+        self.assertEqual(generate.clean_requirements("numpy==1.24.2\npandas\n"), (None, []))
+
+    def test_quoting_survives_shell_characters(self):
+        cleaned, _ = generate.clean_requirements("a==1\na==2\nb; python_version < '3.9'\n")
+        quoted = " ".join(generate._sh_quote(x) for x in cleaned)
+        import shlex
+        self.assertEqual(shlex.split(quoted), ["a==2", "b; python_version < '3.9'"])
+
+    def test_repo_that_imports_itself_gets_a_package_layout(self):
+        # UAP: main.py has `from uap.train.model_structure import get_model`
+        text, _, notes = self.gen("uap", {"main.py": "from uap.train.model_structure import get_model\n",
+                                          "train/model_structure.py": "import models\n", "models/__init__.py": ""})
+        lines = text.splitlines()
+        self.assertIn("COPY . /workspace/uap", lines)
+        self.assertIn("ENV PYTHONPATH=/workspace:/workspace/uap", lines)
+        self.assertIn("WORKDIR /workspace/uap", lines)
+        self.assertNotIn("COPY . /workspace", lines)
+        self.assertTrue(any("imports the repository itself" in n for n in notes))
+
+    def test_other_repos_keep_workspace(self):
+        text, _, _ = self.gen("plainrepo", {"main.py": "import os\n"})
+        self.assertIn("COPY . /workspace", text.splitlines())
+        self.assertNotIn("PYTHONPATH", text)
+
+
+class TestSetuptools(GenerateCase):
+    def test_pkg_resources_stays_available(self):
+        # UAP: art (Adversarial Robustness Toolbox 1.17) imports pkg_resources.packaging
+        text, _, notes = self.gen("st", {"a.py": "import numpy\n"})
+        lines = text.splitlines()
+        self.assertIn('RUN pip install "setuptools<70"', lines)
+        self.assertLess(lines.index('RUN pip install "setuptools<70"'), lines.index("COPY . /workspace"))
+        self.assertTrue(any("pkg_resources" in n for n in notes))

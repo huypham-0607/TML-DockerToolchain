@@ -33,6 +33,11 @@ class TestIsRetryable(unittest.TestCase):
     def test_rcac_rate_limit_400(self):
         self.assertTrue(llm.is_retryable(FakeBadRequest(RCAC_RATE_LIMIT)))
 
+    def test_rcac_server_connection_error(self):
+        # ended the UAP agent run after 26 minutes (Sat 7 Nov)
+        self.assertTrue(llm.is_retryable(FakeBadRequest("Error code: 400 - {'detail': 'Open WebUI: Server Connection Error'}")))
+        self.assertTrue(llm.is_retryable(Exception("Error code: 503 - Service Unavailable")))
+
     def test_429(self):
         self.assertTrue(llm.is_retryable(Exception("Error code: 429 - Too Many Requests")))
 
@@ -132,3 +137,15 @@ class TestSettings(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestToolNames(unittest.TestCase):
+    def test_leaked_chat_format_tokens_are_cut_from_tool_names(self):
+        self.assertEqual(llm.clean_tool_name("container_status<|channel|>commentary"), "container_status")
+        self.assertEqual(llm.clean_tool_name("build_image"), "build_image")
+        msg = AIMessage(content="", tool_calls=[
+            {"name": "container_status<|channel|>commentary", "args": {"container": ""}, "id": "1"},
+            {"name": "ls", "args": {"path": "/"}, "id": "2"}])
+        fixed = llm.fix_tool_names(ChatResult(generations=[ChatGeneration(message=msg)]))
+        self.assertEqual([c["name"] for c in fixed.generations[0].message.tool_calls], ["container_status", "ls"])
