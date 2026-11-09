@@ -217,6 +217,35 @@ These parts of the design are not in the repository at this time:
 
 - Dockerfile templates for conda and for CUDA base images (`nvidia/cuda`) for code that compiles CUDA
 
+### GPU Setup (NVIDIA)
+
+The toolchain works without a GPU. On a machine with an NVIDIA GPU, Docker needs the GPU driver and a way to pass the GPU into containers. Without them, `generate_dockerfile` installs the CPU build of PyTorch, and its notes say "Docker on this machine cannot attach an NVIDIA GPU".
+
+- **Windows (WSL 2):** install the NVIDIA driver on Windows, and use Docker Desktop with WSL integration on. Nothing else is needed inside WSL. Do not install a Linux NVIDIA driver inside WSL.
+- **Linux:** install the NVIDIA driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Then describe the GPU for Docker and restart Docker. On Arch:
+
+  ```bash
+  sudo pacman -S nvidia-container-toolkit
+  sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+  nvidia-ctk cdi list                 # must list nvidia.com/gpu=0 and nvidia.com/gpu=all
+  sudo systemctl restart docker
+  ```
+
+  The file `/etc/cdi/nvidia.yaml` names the files of the installed driver. Run the `cdi generate` command again after each NVIDIA driver update.
+
+  On Ubuntu or Debian, install `nvidia-container-toolkit` from NVIDIA's apt repository (refer to the link above). Then run `sudo nvidia-ctk runtime configure --runtime=docker` and `sudo systemctl restart docker`.
+
+Make sure that it works: `docker run --rm --gpus all ubuntu nvidia-smi` must show your GPU.
+
+After you correct the setup, delete `~/.cache/tml-dockertoolchain/gpu_attach.json` if it exists. The toolchain remembers a failed GPU attempt for 7 days, and does not try the GPU again in that time.
+
+**New GPUs and old PyTorch:** each PyTorch release supports only the GPU generations that existed when it was released. For example, an RTX 5060 (2025, CUDA capability `sm_120`) needs PyTorch 2.7 or later with CUDA 12.8 or later. On an RTX 5060, repositories that pin old versions failed:
+
+- UAP (torch 2.2.0) stops with "no kernel image is available for execution on the device".
+- FFB (torch 1.13.1) shows a "not compatible with the current PyTorch installation" warning, and then gives wrong results without an error.
+
+Repositories that pin no version get the newest PyTorch, and work. To use the CPU build for a repository that pins an old version, set `TML_TORCH_BUILD=cpu` before you generate its Dockerfile.
+
 ## Evaluation Against the Reference Dockerfiles
 
 `references/` has a hand-made Dockerfile for each of the four target repositories (IPMix, Fair Fairness Benchmark, EP/BNP, UAP), with a CPU smoke test (`smoke.py`) that runs the repository's own code without a GPU, a dataset or the network. `references/README.md` lists the problems in each repository that the Dockerfiles had to work around: the cases the pipeline must handle.
