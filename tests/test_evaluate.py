@@ -200,3 +200,46 @@ class TestMerge(unittest.TestCase):
             bad.write_text("{not json")
             self.assertEqual([r.name for r in ev.merge([ev.Result("ffb", "agent")], bad)], ["ffb"])
             self.assertEqual([r.name for r in ev.merge([ev.Result("ffb", "agent")], Path(t) / "none.json")], ["ffb"])
+
+
+class TestOtherModels(unittest.TestCase):
+    """Testing "with other agents": the same tools driven by another LLM keep their own rows."""
+
+    def test_rows_of_two_models_are_kept_apart(self):
+        import json
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / "results.json"
+            path.write_text(json.dumps([
+                {"name": "ffb", "mode": "agent", "built": True, "smoke_passed": True},  # before the model column
+                {"name": "ffb", "mode": "template", "built": True},
+            ]))
+            rows = ev.merge([ev.Result("ffb", "agent", built=True, smoke_passed=False, model="qwen3.6:27b")], path)
+        got = {(r.mode, r.model): r.smoke_passed for r in rows}
+        self.assertEqual(got[("agent", ev.LEGACY_AGENT_MODEL)], True)
+        self.assertEqual(got[("agent", "qwen3.6:27b")], False)
+        self.assertIn(("template", ""), got)
+        table = ev.report(rows)
+        self.assertIn("| ffb | agent (qwen3.6:27b) |", table)
+        self.assertIn("| ffb | agent (gpt-oss:120b) |", table)
+
+    def test_current_model_follows_the_environment(self):
+        with mock.patch.dict("os.environ", {"LLM_PROVIDER": "rcac", "LLM_MODEL": "gemma4:26b-a4b"}):
+            self.assertEqual(ev.current_model(), "gemma4:26b-a4b")
+        with mock.patch.dict("os.environ", {"LLM_PROVIDER": "openai", "LLM_MODEL": ""}):
+            self.assertEqual(ev.current_model(), "gpt-5-mini")
+
+    def test_model_flag_needs_agent_mode(self):
+        import io
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ev.main(["--model", "qwen3.6:27b", "ffb"])
+
+    def test_model_flag_sets_the_environment(self):
+        with mock.patch.dict("os.environ", {}, clear=False), \
+                mock.patch.object(ev.subprocess, "run", return_value=mock.Mock(returncode=1)):
+            import io
+            from contextlib import redirect_stderr
+            with redirect_stderr(io.StringIO()):
+                ev.main(["--agent", "--model", "qwen3.6:27b", "ffb"])
+            import os
+            self.assertEqual(os.environ["LLM_MODEL"], "qwen3.6:27b")

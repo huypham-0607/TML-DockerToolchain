@@ -11,8 +11,11 @@ For each repository in references/repos.txt:
        python   Python major.minor, same as the reference image?
        torch    torch / torchvision versions (without +cpu / +cuNNN), same as the reference?
        smoke    does references/<name>/smoke.py pass in the pipeline's image (no network)?
-  4. add the rows to runs/eval/results.json (one row per repository and mode: a new run replaces
-     that row and keeps the others) and write runs/eval/results.md from all rows.
+  4. add the rows to runs/eval/results.json (one row per repository, mode and model: a new run
+     replaces that row and keeps the others) and write runs/eval/results.md from all rows.
+
+Other agents: --model runs the same tools with another LLM (LLM_MODEL), and --provider with another
+provider (LLM_PROVIDER: rcac or openai). Each model keeps its own rows, so the table compares them.
 
 The reference images (tml-ref/<name>:latest) come from references/run.sh. Without them, the
 python / torch columns show the pipeline's versions only.
@@ -21,6 +24,7 @@ Usage:
     uv run python -m scripts.evaluate                    # template mode, all four
     uv run python -m scripts.evaluate ffb ep_bnp         # some of them
     uv run python -m scripts.evaluate --agent ffb        # full agent on FFB
+    uv run python -m scripts.evaluate --agent --model qwen3.6:27b ffb   # the same, another LLM
     uv run python -m scripts.evaluate --skip-build ffb   # re-score the image built last time
     uv run python -m scripts.evaluate --clean            # remove the images it made at the end
     uv run python -m scripts.evaluate --fresh            # forget earlier results first
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -71,6 +76,19 @@ class Result:
     smoke_tail: str = ""
     agent: dict = field(default_factory=dict)
     seconds: float = 0.0
+    model: str = ""   # agent mode: the LLM that drove the tools
+
+
+# Every agent run before the model column existed used the default model.
+LEGACY_AGENT_MODEL = "gpt-oss:120b"
+
+
+def current_model() -> str:
+    """The model make_model() will use: LLM_MODEL, else the provider's default (reads .env first)."""
+    from src.llm import PROVIDERS  # importing src.llm loads .env
+
+    provider = os.environ.get("LLM_PROVIDER", "rcac").lower()
+    return os.environ.get("LLM_MODEL") or PROVIDERS.get(provider, PROVIDERS["rcac"])["model"]
 
 
 # ---------------------------------------------------------------- helpers
@@ -171,6 +189,7 @@ def pipeline_image(name: str, repo: Path, mode: str, skip_build: bool, result: R
         return
 
     # agent mode
+    result.model = current_model()
     if skip_build:
         result.image = f"tml/{repo.name.lower()}:latest"
         result.built = image_exists(result.image)
@@ -179,7 +198,7 @@ def pipeline_image(name: str, repo: Path, mode: str, skip_build: bool, result: R
     from scripts.run_agent import run_agent
 
     OUT.mkdir(parents=True, exist_ok=True)
-    summary = run_agent(AGENT_PROMPT.format(repo=repo), log_path=str(OUT / f"{name}-agent.log"))
+    summary = run_agent(AGENT_PROMPT.format(repo=repo), log_path=str(OUT / f"{name}-agent-{_slug(result.model)}.log"))
     result.agent = {k: summary[k] for k in ("rounds", "seconds", "tools_used", "images_built", "crashed")}
     result.agent["builds"] = summary["tools_used"].get("build_image", 0)
     if summary["images_built"]:
@@ -188,6 +207,10 @@ def pipeline_image(name: str, repo: Path, mode: str, skip_build: bool, result: R
         result.build_note = f"built in {result.agent['builds']} build attempt(s)"
     else:
         result.build_note = "the agent built no image" + (f" ({summary['crashed'][:120]})" if summary["crashed"] else "")
+
+
+def _slug(text: str) -> str:
+    return "".join(c if c.isalnum() or c in "-." else "_" for c in text) or "model"
 
 
 def evaluate_one(name: str, url: str, commit: str, mode: str, skip_build: bool) -> Result:
@@ -221,7 +244,8 @@ def report(results: list[Result]) -> str:
         note = r.build_note
         if r.smoke_passed is False and r.smoke_tail:
             note += "; smoke: " + r.smoke_tail.strip().splitlines()[-1][:120]
-        rows.append(f"| {r.name} | {r.mode} | {'✅' if r.built else '❌'} | "
+        mode = f"{r.mode} ({r.model})" if r.model else r.mode
+        rows.append(f"| {r.name} | {mode} | {'✅' if r.built else '❌'} | "
                     f"{compare('python', r.versions, r.reference_versions)} | "
                     f"{compare('torch', r.versions, r.reference_versions)} | "
                     f"{compare('torchvision', r.versions, r.reference_versions)} | {smoke} | "
@@ -231,17 +255,20 @@ def report(results: list[Result]) -> str:
 
 
 def merge(new: list[Result], path: Path) -> list[Result]:
-    """Earlier rows from `path`, with each (name, mode) row of `new` replacing its old row."""
+    """Earlier rows from `path`, with each (name, mode, model) row of `new` replacing its old row."""
     old: list[Result] = []
     try:
         for row in json.loads(path.read_text()):
             old.append(Result(**{k: v for k, v in row.items() if k in Result.__dataclass_fields__}))
     except (OSError, ValueError, TypeError):
         pass
-    replaced = {(r.name, r.mode) for r in new}
-    kept = [r for r in old if (r.name, r.mode) not in replaced]
+    for r in old + new:
+        if r.mode == "agent" and not r.model:
+            r.model = LEGACY_AGENT_MODEL
+    replaced = {(r.name, r.mode, r.model) for r in new}
+    kept = [r for r in old if (r.name, r.mode, r.model) not in replaced]
     order = {n: i for i, n in enumerate(read_repos())}
-    return sorted(kept + new, key=lambda r: (r.mode, order.get(r.name, 99)))
+    return sorted(kept + new, key=lambda r: (r.mode, r.model, order.get(r.name, 99)))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -251,6 +278,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--skip-build", action="store_true", help="score the image an earlier run built")
     p.add_argument("--clean", action="store_true", help="remove the pipeline images at the end")
     p.add_argument("--fresh", action="store_true", help="forget the results of earlier runs")
+    p.add_argument("--model", default="", help="agent mode: the LLM to use (sets LLM_MODEL), e.g. qwen3.6:27b")
+    p.add_argument("--provider", default="", help="agent mode: rcac or openai (sets LLM_PROVIDER)")
     args = p.parse_args(argv)
 
     repos = read_repos()
@@ -259,6 +288,12 @@ def main(argv: list[str] | None = None) -> int:
     if unknown:
         p.error(f"unknown repositories {unknown}; choose from {list(repos)}")
     mode = "agent" if args.agent else "template"
+    if (args.model or args.provider) and not args.agent:
+        p.error("--model and --provider choose the agent's LLM: use them with --agent")
+    if args.provider:
+        os.environ["LLM_PROVIDER"] = args.provider
+    if args.model:
+        os.environ["LLM_MODEL"] = args.model
     # without a daemon every image check says "missing": stop with the real reason instead
     if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
         print("Docker is not reachable: start Docker Desktop (or the Docker daemon), wait until it runs, "

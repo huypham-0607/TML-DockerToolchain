@@ -231,7 +231,8 @@ These parts of the design are not in the repository at this time:
 
    ```bash
    uv run python -m scripts.evaluate                 # template step only: no LLM, no API key
-   uv run python -m scripts.evaluate --agent ffb     # the full agent on one repository (10 to 40 minutes)
+   uv run python -m scripts.evaluate --agent ffb     # the full agent on one repository (about 2 minutes)
+   uv run python -m scripts.evaluate --agent --model qwen3.6:27b ffb   # the same tools, another LLM
    ```
 
 For each repository, `scripts/evaluate.py` clones it at the pinned commit (`references/repos.txt`), lets the pipeline build an image, and reports:
@@ -242,7 +243,9 @@ For each repository, `scripts/evaluate.py` clones it at the pinned commit (`refe
 | Python, torch, torchvision | The versions in the pipeline's image, and whether they match the reference image. |
 | Smoke test | The reference `smoke.py` passes in the pipeline's image. |
 
-The table is saved to `runs/eval/results.md` and `runs/eval/results.json`. Each run adds or replaces one row per repository and mode and keeps the other rows, so repositories can be run one at a time (`--fresh` starts over). `--skip-build` scores the image that an earlier run built, without running the pipeline again. The agent's transcript for each repository is saved to `runs/eval/<name>-agent.log`.
+The table is saved to `runs/eval/results.md` and `runs/eval/results.json`. Each run adds or replaces one row per repository, mode and model, and keeps the other rows, so repositories and models can be run one at a time (`--fresh` starts over). `--skip-build` scores the image that an earlier run built, without running the pipeline again. The agent's transcript is saved to `runs/eval/<name>-agent-<model>.log`.
+
+**Other agents.** `--model` drives the same tools with another LLM (it sets `LLM_MODEL`), and `--provider openai` with OpenAI instead of RCAC (it sets `LLM_PROVIDER`; needs `OPENAI_API_KEY`). Each model gets its own rows, labelled for example `agent (qwen3.6:27b)`, so the table compares models. RCAC lists the models your key can use at `https://genai.rcac.purdue.edu/api/models`.
 
 ## Agent Toolchain Categories
 
