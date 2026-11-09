@@ -99,6 +99,10 @@ stop_container, destroy_container):
   - import the repository's own modules, or run its main scripts with --help, from the directory the
     README runs them in. An ImportError or ModuleNotFoundError here means the image is incomplete:
     fix the Dockerfile and build again (it counts as a build attempt).
+- Smoke tests must be quick and offline: do not download datasets or pretrained weights, and do not
+  run real training. Run one step on a small random input instead (for example a random tensor of the
+  right shape through the model). A command is killed after 300 seconds. After a timeout, read "hint"
+  and do not run the same command again.
 - Read "ok" and "exit_code" in the reply. A non-zero exit code means the environment is wrong even
   though the container runs. Say so; do not report success.
 - If code needs an NVIDIA GPU (inspect_repo "gpu", or a "CUDA not available" error) and this machine has
