@@ -79,6 +79,9 @@ The toolchain changes a research repository into a validated Docker environment.
    # Optional: use OpenAI instead of Purdue GenAI
    # export LLM_PROVIDER="openai"
    # export OPENAI_API_KEY="<your OpenAI API key>"
+   # Optional: use Claude instead
+   # export LLM_PROVIDER="anthropic"
+   # export ANTHROPIC_API_KEY="<your Anthropic API key>"
    export LANGSMITH_TRACING="true"
    export LANGSMITH_API_KEY="<your LangSmith API key>"
    ```
@@ -87,10 +90,11 @@ The toolchain changes a research repository into a validated Docker environment.
 
 | Variable | Necessary | Purpose |
 | --- | --- | --- |
-| `LLM_PROVIDER` | No | `rcac` (default) or `openai`. |
+| `LLM_PROVIDER` | No | `rcac` (default), `openai` or `anthropic`. |
 | `LLM_MODEL` | No | Overrides the default model of the provider. |
 | `GENAI_API_KEY` | If `LLM_PROVIDER=rcac` (default) | The key for the Purdue GenAI API. |
 | `OPENAI_API_KEY` | If `LLM_PROVIDER=openai` | The key for the OpenAI API. |
+| `ANTHROPIC_API_KEY` | If `LLM_PROVIDER=anthropic` | The key for the Anthropic (Claude) API. |
 | `LANGSMITH_TRACING` | No | Set to `true` to record LangSmith traces. |
 | `LANGSMITH_API_KEY` | No | Necessary only if LangSmith tracing is on. |
 | `LLM_REQUESTS_PER_MINUTE` | No | Client-side request limit. Default: 18 for `rcac` (Purdue GenAI allows 20 per minute per user), 120 for `openai`. |
@@ -109,8 +113,9 @@ The toolchain changes a research repository into a validated Docker environment.
 | --- | --- | --- | --- |
 | `rcac` (default) | `gpt-oss:120b` | `https://genai.rcac.purdue.edu/api` | `GENAI_API_KEY` |
 | `openai` | `gpt-5-mini` | OpenAI | `OPENAI_API_KEY` |
+| `anthropic` | `claude-sonnet-5-5` | Anthropic (Claude's own API, through `langchain-anthropic`) | `ANTHROPIC_API_KEY` |
 
-To add a provider, add an entry to `PROVIDERS` in `src/llm.py`.
+`LLM_MODEL` picks another model of the same provider, for example `claude-opus-5-5`. To add a provider, add an entry to `PROVIDERS` in `src/llm.py`: OpenAI-compatible APIs need only the entry; others need a chat class like `RetryingChatAnthropic`.
 
 Purdue GenAI allows 20 requests per minute per user ([RCAC GenAI API](https://docs.rcac.purdue.edu/services/genai/api/)). It answers a rate limit with HTTP 400 ("Rate limit exceeded") instead of 429, so the OpenAI client does not retry it, and it can answer with a JSON `null` instead of an error. `src/llm.py` keeps the request rate under the limit and retries both cases with waits.
 
@@ -180,7 +185,7 @@ Sections:
 | `src/main.py` | Command-line entry point. Sends one question to the agent and prints the last reply. |
 | `src/agent.py` | Makes the agent with `deepagents`, with all the tools and one pipeline system prompt. Gets the model from `src/llm.py` and the file backend from `src/fs_backend.py`. |
 | `src/fs_backend.py` | The backend of the agent's built-in file tools (`ls`, `read_file`, `glob`, `grep`): the real disk, read-only, without secret files such as `.env`. Writes go only to an in-memory `/agent_scratch/`. |
-| `src/llm.py` | Makes the chat model for the provider in `LLM_PROVIDER` (OpenAI or Purdue GenAI): 18 requests per minute for Purdue GenAI, and retries when the server refuses for now. |
+| `src/llm.py` | Makes the chat model for the provider in `LLM_PROVIDER` (Purdue GenAI, OpenAI or Anthropic): 18 requests per minute for Purdue GenAI, and retries when the server refuses for now. |
 | `src/tools.py` | The tools `inspect_repo`, `generate_dockerfile`, and `build_image`. |
 | `scripts/smoke_test.py` | Checks the configuration, the LLM endpoint, tool calling, and one agent inspection. |
 | `scripts/run_agent.py` | Runs the agent and prints every step. |
@@ -274,7 +279,7 @@ For each repository, `scripts/evaluate.py` clones it at the pinned commit (`refe
 
 The table is saved to `runs/eval/results.md` and `runs/eval/results.json`. Each run adds or replaces one row per repository, mode and model, and keeps the other rows, so repositories and models can be run one at a time (`--fresh` starts over). `--skip-build` scores the image that an earlier run built, without running the pipeline again. The agent's transcript is saved to `runs/eval/<name>-agent-<model>.log`.
 
-**Other agents.** `--model` drives the same tools with another LLM (it sets `LLM_MODEL`), and `--provider openai` with OpenAI instead of RCAC (it sets `LLM_PROVIDER`; needs `OPENAI_API_KEY`). Each model gets its own rows, labelled for example `agent (qwen3.6:27b)`, so the table compares models. RCAC lists the models your key can use at `https://genai.rcac.purdue.edu/api/models`.
+**Other agents.** `--model` drives the same tools with another LLM (it sets `LLM_MODEL`), and `--provider openai` or `--provider anthropic` with OpenAI or Claude instead of RCAC (it sets `LLM_PROVIDER`; needs `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`). Each model gets its own rows, labelled for example `agent (qwen3.6:27b)`, so the table compares models. RCAC lists the models your key can use at `https://genai.rcac.purdue.edu/api/models`.
 
 ## Agent Toolchain Categories
 

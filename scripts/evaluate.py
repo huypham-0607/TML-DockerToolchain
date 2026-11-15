@@ -15,7 +15,7 @@ For each repository in references/repos.txt:
      replaces that row and keeps the others) and write runs/eval/results.md from all rows.
 
 Other agents: --model runs the same tools with another LLM (LLM_MODEL), and --provider with another
-provider (LLM_PROVIDER: rcac or openai). Each model keeps its own rows, so the table compares them.
+provider (LLM_PROVIDER: rcac, openai or anthropic). Each model keeps its own rows, so the table compares them.
 
 The reference images (tml-ref/<name>:latest) come from references/run.sh. Without them, the
 python / torch columns show the pipeline's versions only.
@@ -25,6 +25,7 @@ Usage:
     uv run python -m scripts.evaluate ffb ep_bnp         # some of them
     uv run python -m scripts.evaluate --agent ffb        # full agent on FFB
     uv run python -m scripts.evaluate --agent --model qwen3.6:27b ffb   # the same, another LLM
+    uv run python -m scripts.evaluate --agent --provider anthropic ffb  # the same, with Claude
     uv run python -m scripts.evaluate --skip-build ffb   # re-score the image built last time
     uv run python -m scripts.evaluate --clean            # remove the images it made at the end
     uv run python -m scripts.evaluate --fresh            # forget earlier results first
@@ -279,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--clean", action="store_true", help="remove the pipeline images at the end")
     p.add_argument("--fresh", action="store_true", help="forget the results of earlier runs")
     p.add_argument("--model", default="", help="agent mode: the LLM to use (sets LLM_MODEL), e.g. qwen3.6:27b")
-    p.add_argument("--provider", default="", help="agent mode: rcac or openai (sets LLM_PROVIDER)")
+    p.add_argument("--provider", default="", help="agent mode: rcac, openai or anthropic (sets LLM_PROVIDER)")
     args = p.parse_args(argv)
 
     repos = read_repos()

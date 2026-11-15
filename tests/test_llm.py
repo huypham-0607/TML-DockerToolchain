@@ -149,3 +149,54 @@ class TestToolNames(unittest.TestCase):
             {"name": "ls", "args": {"path": "/"}, "id": "2"}])
         fixed = llm.fix_tool_names(ChatResult(generations=[ChatGeneration(message=msg)]))
         self.assertEqual([c["name"] for c in fixed.generations[0].message.tool_calls], ["container_status", "ls"])
+
+
+class TestAnthropic(unittest.TestCase):
+    """LLM_PROVIDER=anthropic: the same agent and tools, driven by Claude."""
+
+    def claude(self, **env):
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k", **env}):
+            return llm.make_model("anthropic")
+
+    def test_default_model_and_rate(self):
+        m = self.claude()
+        self.assertIsInstance(m, llm.RetryingChatAnthropic)
+        self.assertEqual(m.model, "claude-sonnet-5-5")
+        self.assertAlmostEqual(m.rate_limiter.requests_per_second * 60, 50)
+        self.assertGreaterEqual(m.max_tokens, 4096)
+
+    def test_model_override(self):
+        self.assertEqual(self.claude(LLM_MODEL="claude-opus-5-5").model, "claude-opus-5-5")
+
+    def test_missing_key_is_a_clear_error(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(llm, "load_dotenv"):
+            with self.assertRaises(RuntimeError) as ctx:
+                llm.make_model("anthropic")
+        self.assertIn("ANTHROPIC_API_KEY", str(ctx.exception))
+
+    def test_binds_tools(self):
+        from langchain_core.tools import tool
+
+        @tool
+        def ping() -> str:
+            """ping"""
+            return "pong"
+
+        self.assertIsNotNone(self.claude().bind_tools([ping]))
+
+    def test_overloaded_is_retried(self):
+        from langchain_anthropic import ChatAnthropic
+        m = self.claude()
+        m.wait_scale = 0
+        ok = ChatResult(generations=[ChatGeneration(message=AIMessage(content="pong"))])
+        calls = iter([FakeBadRequest("Error code: 529 - {'type': 'overloaded_error'}"), ok])
+
+        def fake(*a, **k):
+            x = next(calls)
+            if isinstance(x, Exception):
+                raise x
+            return x
+
+        with mock.patch.object(ChatAnthropic, "_generate", side_effect=fake):
+            out = m._generate([])
+        self.assertEqual(out.generations[0].message.content, "pong")
