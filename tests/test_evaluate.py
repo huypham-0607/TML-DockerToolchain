@@ -37,8 +37,8 @@ class TestHelpers(unittest.TestCase):
         ref = {"python": "3.8", "torch": "1.13.1+cpu", "torchvision": "0.14.1+cpu"}
         self.assertEqual(ev.compare("python", {"python": "3.8"}, ref), "3.8 ✅")
         self.assertEqual(ev.compare("torch", {"torch": "1.13.1+cu117"}, ref), "1.13.1 ✅")     # build suffix ignored
-        self.assertEqual(ev.compare("torch", {"torch": "2.0.1"}, ref), "2.0.1 ❌ (ref 1.13.1)")
-        self.assertEqual(ev.compare("torchvision", {"torchvision": None}, ref), "missing ❌ (ref 0.14.1)")
+        self.assertEqual(ev.compare("torch", {"torch": "2.0.1"}, ref), "2.0.1 (ref 1.13.1)")
+        self.assertEqual(ev.compare("torchvision", {"torchvision": None}, ref), "missing (ref 0.14.1)")
         self.assertEqual(ev.compare("torch", {"torch": "2.0.1"}, {}), "2.0.1")                   # no reference image
         self.assertEqual(ev.compare("torch", {}, ref), "-")                                       # nothing built
 

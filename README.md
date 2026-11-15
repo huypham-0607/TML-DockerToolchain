@@ -274,7 +274,7 @@ For each repository, `scripts/evaluate.py` clones it at the pinned commit (`refe
 | Column | Meaning |
 | --- | --- |
 | Builds | The pipeline produced an image. |
-| Python, torch, torchvision | The versions in the pipeline's image, and whether they match the reference image. |
+| Python, torch, torchvision | The versions in the pipeline's image: ✅ when they match the reference image, else the reference's version in brackets, for example `2.14.1 (ref 2.0.1)`. A different version is not a failure: the smoke test decides. |
 | Packages vs reference | How many of the reference image's Python packages the pipeline's image has at the same version (`pip list` in both; pip, setuptools, wheel and the NVIDIA libraries of CUDA builds are left out). The report lists the packages with another version, the missing ones and the extra ones. |
 | Smoke test | The reference `smoke.py` passes in the pipeline's image. |
 

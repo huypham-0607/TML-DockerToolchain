@@ -214,7 +214,8 @@ def compare(field_name: str, got: dict, want: dict) -> str:
     w = want.get(field_name) if field_name == "python" else public(want.get(field_name))
     if g == w:
         return f"{g} ✅"
-    return f"{g or 'missing'} ❌ (ref {w})"
+    # a different version is not a failure (the smoke test decides): no ❌, only the reference's version
+    return f"{g or 'missing'} (ref {w})"
 
 
 # ---------------------------------------------------------------- one repository
@@ -311,6 +312,8 @@ def report(results: list[Result]) -> str:
                     f"{note.replace('|', '/')} |")
     passed = sum(1 for r in results if r.smoke_passed)
     text = "\n".join(rows) + f"\n\n**{passed} of {len(results)}** pipeline images pass the reference smoke test.\n"
+    text += ("\n✅ = same version as the hand-made reference. \"(ref X)\" = the pipeline installed another version "
+             "than the reference; that is not a failure: the smoke test shows whether the code runs.\n")
     details = [package_details(r) for r in results if r.packages.get("reference")]
     if details:
         text += "\n## Package differences from the reference image\n\n" + "\n".join(details)
