@@ -63,6 +63,9 @@ class TestEvaluateOne(unittest.TestCase):
             mock.patch.object(ev, "image_exists", side_effect=lambda tag: True),
             mock.patch.object(ev, "probe_versions", side_effect=lambda tag: {"python": "3.8", "torch": "1.13.1", "tag": tag}),
             mock.patch.object(ev, "run_smoke", return_value=(True, "SMOKE OK")),
+            mock.patch.object(ev, "probe_packages", side_effect=lambda tag: (
+                {"torch": "1.13.1", "pandas": "1.5.3", "tabulate": "0.9.0"} if tag.startswith("tml-ref/")
+                else {"torch": "1.13.1", "pandas": "2.0.0", "seaborn": "0.13.2"})),
             mock.patch.object(ev, "OUT", Path(self._tmp.name) / "out"),
         ]
         for p in patches:
@@ -243,3 +246,56 @@ class TestOtherModels(unittest.TestCase):
                 ev.main(["--agent", "--model", "qwen3.6:27b", "ffb"])
             import os
             self.assertEqual(os.environ["LLM_MODEL"], "qwen3.6:27b")
+
+
+class TestPackages(unittest.TestCase):
+    """Validation data: every package of the pipeline's image against the reference image."""
+
+    def test_compare(self):
+        c = ev.compare_packages(
+            {"torch": "1.13.1", "pandas": "2.0.0", "seaborn": "0.13.2", "pip": "24.0", "nvidia-cublas-cu11": "11.10"},
+            {"torch": "1.13.1", "pandas": "1.5.3", "tabulate": "0.9.0", "pip": "23.0", "setuptools": "65"})
+        self.assertEqual(c["reference"], 3)   # pip / setuptools ignored
+        self.assertEqual(c["same"], {"torch": "1.13.1"})
+        self.assertEqual(c["different"], {"pandas": ["2.0.0", "1.5.3"]})
+        self.assertEqual(c["missing"], ["tabulate"])
+        self.assertEqual(c["extra"], ["seaborn"])   # nvidia-* ignored
+        self.assertEqual(ev.packages_cell(c), "1/3 same (33%)")
+        self.assertEqual(ev.packages_cell({}), "-")
+
+    def test_report_and_csv(self):
+        r = ev.Result("ffb", "template", built=True, smoke_passed=True,
+                      packages=ev.compare_packages({"torch": "1.13.1", "pandas": "2.0.0"},
+                                                   {"torch": "1.13.1", "pandas": "1.5.3", "tabulate": "0.9.0"}))
+        table = ev.report([r])
+        self.assertIn("1/3 same (33%)", table)
+        self.assertIn("pandas 2.0.0 vs 1.5.3", table)
+        self.assertIn("in the reference, not in the pipeline image: tabulate", table)
+        lines = ev.packages_csv([r]).strip().splitlines()
+        self.assertEqual(lines[0], "repo,mode,model,package,pipeline_version,reference_version,status")
+        self.assertIn("ffb,template,,torch,1.13.1,1.13.1,same", lines)
+        self.assertIn("ffb,template,,pandas,2.0.0,1.5.3,different", lines)
+        self.assertIn("ffb,template,,tabulate,,,missing", lines)
+
+    def test_evaluate_one_fills_packages(self):
+        t = TestEvaluateOne("test_template_mode_builds_and_scores")
+        t.setUp()
+        try:
+            build = mock.Mock(success=True, log_tail="", log_path="x")
+            with mock.patch("src.docker.generate.generate_dockerfile", return_value=("FROM x\n", t.repo / "Dockerfile", [])), \
+                    mock.patch("src.docker.build.build_image", return_value=build):
+                r = ev.evaluate_one("ffb", "https://github.com/x/ffb", "0" * 40, mode="template", skip_build=False)
+        finally:
+            t.doCleanups()
+            t.tearDown()
+        self.assertEqual(r.packages["same"], {"torch": "1.13.1"})
+        self.assertEqual(r.packages["missing"], ["tabulate"])
+
+    def test_old_rows_without_packages_still_load(self):
+        import json
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / "results.json"
+            path.write_text(json.dumps([{"name": "ffb", "mode": "template", "built": True}]))
+            rows = ev.merge([], path)
+        self.assertEqual(rows[0].packages, {})
+        self.assertIn("| - |", ev.report(rows))

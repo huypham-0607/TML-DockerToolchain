@@ -275,9 +275,10 @@ For each repository, `scripts/evaluate.py` clones it at the pinned commit (`refe
 | --- | --- |
 | Builds | The pipeline produced an image. |
 | Python, torch, torchvision | The versions in the pipeline's image, and whether they match the reference image. |
+| Packages vs reference | How many of the reference image's Python packages the pipeline's image has at the same version (`pip list` in both; pip, setuptools, wheel and the NVIDIA libraries of CUDA builds are left out). The report lists the packages with another version, the missing ones and the extra ones. |
 | Smoke test | The reference `smoke.py` passes in the pipeline's image. |
 
-The table is saved to `runs/eval/results.md` and `runs/eval/results.json`. Each run adds or replaces one row per repository, mode and model, and keeps the other rows, so repositories and models can be run one at a time (`--fresh` starts over). `--skip-build` scores the image that an earlier run built, without running the pipeline again. The agent's transcript is saved to `runs/eval/<name>-agent-<model>.log`.
+The table is saved to `runs/eval/results.md` and `runs/eval/results.json`, and the package comparison, one line per package, to `runs/eval/packages.csv` (for a spreadsheet). Each run adds or replaces one row per repository, mode and model, and keeps the other rows, so repositories and models can be run one at a time (`--fresh` starts over). `--skip-build` scores the image that an earlier run built, without running the pipeline again. The agent's transcript is saved to `runs/eval/<name>-agent-<model>.log`.
 
 **Other agents.** `--model` drives the same tools with another LLM (it sets `LLM_MODEL`), and `--provider openai` or `--provider anthropic` with OpenAI or Claude instead of RCAC (it sets `LLM_PROVIDER`; needs `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`). Each model gets its own rows, labelled for example `agent (qwen3.6:27b)`, so the table compares models. RCAC lists the models your key can use at `https://genai.rcac.purdue.edu/api/models`.
 
