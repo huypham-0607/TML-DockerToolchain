@@ -2,10 +2,12 @@
     Chat model selection
 
     Pick the provider with LLM_PROVIDER (default: rcac) and optionally the model with LLM_MODEL.
-    Both providers speak the OpenAI API; only the endpoint, key and default model differ.
+    rcac and openai speak the OpenAI API; anthropic uses Claude's own API (langchain-anthropic).
+    The tools, the prompt and the agent are the same for every provider.
 
       LLM_PROVIDER=rcac    -> GENAI_API_KEY,  default model gpt-oss:120b (Purdue RCAC GenAI)
       LLM_PROVIDER=openai  -> OPENAI_API_KEY, default model gpt-5-mini
+      LLM_PROVIDER=anthropic -> ANTHROPIC_API_KEY, default model claude-sonnet-5-5 (Claude)
 
     To add a provider, add an entry to PROVIDERS.
 
@@ -28,6 +30,7 @@ import time
 
 from dotenv import load_dotenv
 from langchain_core.rate_limiters import InMemoryRateLimiter
+from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 
 # Reads .env from the repository root (existing environment variables win)
@@ -40,6 +43,13 @@ PROVIDERS = {
         "api_key_env": "OPENAI_API_KEY",
         "base_url": None,
         "requests_per_minute": 120,
+    },
+    "anthropic": {
+        "model": "claude-sonnet-5-5",
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "base_url": None,
+        "requests_per_minute": 50,   # the lowest Anthropic usage tier
+        "api": "anthropic",
     },
     "rcac": {
         "model": "gpt-oss:120b",
@@ -59,6 +69,7 @@ RETRYABLE_TEXT = (
     "rate limit", "too many requests", "error code: 429",
     "server connection error", "temporarily unavailable", "service unavailable", "bad gateway",
     "gateway timeout", "error code: 502", "error code: 503", "error code: 504",
+    "overloaded", "error code: 529",   # Anthropic: busy servers answer 529 overloaded_error
 )
 
 
@@ -95,11 +106,9 @@ def fix_tool_names(result):
     return result
 
 
-class RetryingChatOpenAI(ChatOpenAI):
-    """ChatOpenAI that waits and retries when the server refuses for now (see is_retryable)."""
-
-    rate_limit_retries: int = DEFAULT_RATE_RETRIES
-    wait_scale: float = 1.0   # tests set 0 so that nothing sleeps
+class RetryMixin:
+    """Waits and retries when the server refuses for now (see is_retryable), and cleans tool names.
+    The chat-model classes below declare the two settings it reads: rate_limit_retries, wait_scale."""
 
     def _wait(self, attempt: int, error: BaseException) -> float:
         seconds = retry_wait(attempt) * self.wait_scale
@@ -128,7 +137,21 @@ class RetryingChatOpenAI(ChatOpenAI):
         raise AssertionError("unreachable")
 
 
-def make_model(provider: str | None = None, model: str | None = None) -> RetryingChatOpenAI:
+class RetryingChatOpenAI(RetryMixin, ChatOpenAI):
+    """ChatOpenAI (RCAC, OpenAI) with RetryMixin."""
+
+    rate_limit_retries: int = DEFAULT_RATE_RETRIES
+    wait_scale: float = 1.0   # tests set 0 so that nothing sleeps
+
+
+class RetryingChatAnthropic(RetryMixin, ChatAnthropic):
+    """ChatAnthropic (Claude) with RetryMixin."""
+
+    rate_limit_retries: int = DEFAULT_RATE_RETRIES
+    wait_scale: float = 1.0
+
+
+def make_model(provider: str | None = None, model: str | None = None) -> RetryingChatOpenAI | RetryingChatAnthropic:
     """Builds the chat model. Arguments override LLM_PROVIDER / LLM_MODEL."""
     provider = (provider or os.environ.get("LLM_PROVIDER", "rcac")).lower()
     if provider not in PROVIDERS:
@@ -146,11 +169,22 @@ def make_model(provider: str | None = None, model: str | None = None) -> Retryin
         max_bucket_size=1,
     )
 
+    name = model or os.environ.get("LLM_MODEL") or cfg["model"]
+    retries = int(os.environ.get("LLM_RATE_RETRIES") or DEFAULT_RATE_RETRIES)
+    if cfg.get("api") == "anthropic":
+        return RetryingChatAnthropic(
+            model=name,
+            api_key=api_key,
+            max_tokens=8192,   # room for a whole Dockerfile and the final report
+            rate_limiter=rate_limiter,
+            max_retries=3,
+            rate_limit_retries=retries,
+        )
     return RetryingChatOpenAI(
-        model=model or os.environ.get("LLM_MODEL") or cfg["model"],
+        model=name,
         base_url=cfg["base_url"],
         api_key=api_key,
         rate_limiter=rate_limiter,
         max_retries=3,   # the OpenAI client's own retries: connection errors, 429, 5xx
-        rate_limit_retries=int(os.environ.get("LLM_RATE_RETRIES") or DEFAULT_RATE_RETRIES),
+        rate_limit_retries=retries,
     )

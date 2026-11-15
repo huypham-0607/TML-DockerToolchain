@@ -11,11 +11,13 @@ For each repository in references/repos.txt:
        python   Python major.minor, same as the reference image?
        torch    torch / torchvision versions (without +cpu / +cuNNN), same as the reference?
        smoke    does references/<name>/smoke.py pass in the pipeline's image (no network)?
+     packages every installed package (pip list) against the reference image: same version,
+              different version, missing from the pipeline's image, or extra in it;
   4. add the rows to runs/eval/results.json (one row per repository, mode and model: a new run
      replaces that row and keeps the others) and write runs/eval/results.md from all rows.
 
 Other agents: --model runs the same tools with another LLM (LLM_MODEL), and --provider with another
-provider (LLM_PROVIDER: rcac or openai). Each model keeps its own rows, so the table compares them.
+provider (LLM_PROVIDER: rcac, openai or anthropic). Each model keeps its own rows, so the table compares them.
 
 The reference images (tml-ref/<name>:latest) come from references/run.sh. Without them, the
 python / torch columns show the pipeline's versions only.
@@ -25,6 +27,7 @@ Usage:
     uv run python -m scripts.evaluate ffb ep_bnp         # some of them
     uv run python -m scripts.evaluate --agent ffb        # full agent on FFB
     uv run python -m scripts.evaluate --agent --model qwen3.6:27b ffb   # the same, another LLM
+    uv run python -m scripts.evaluate --agent --provider anthropic ffb  # the same, with Claude
     uv run python -m scripts.evaluate --skip-build ffb   # re-score the image built last time
     uv run python -m scripts.evaluate --clean            # remove the images it made at the end
     uv run python -m scripts.evaluate --fresh            # forget earlier results first
@@ -35,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -77,6 +81,7 @@ class Result:
     agent: dict = field(default_factory=dict)
     seconds: float = 0.0
     model: str = ""   # agent mode: the LLM that drove the tools
+    packages: dict = field(default_factory=dict)   # compare_packages() against the reference image
 
 
 # Every agent run before the model column existed used the default model.
@@ -129,6 +134,55 @@ def probe_versions(image: str) -> dict:
     return {}
 
 
+# Build tools and the NVIDIA libraries that come with CUDA builds of torch: not part of what a repo needs
+PACKAGES_IGNORED = {"pip", "setuptools", "wheel"}
+PACKAGE_PREFIXES_IGNORED = ("nvidia-", "triton", "cuda-")
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def probe_packages(image: str) -> dict:
+    """{normalized name: version without +local} of the Python packages in `image`; {} if it cannot run."""
+    try:
+        p = subprocess.run(["docker", "run", "--rm", "--network", "none", image,
+                            "python", "-m", "pip", "list", "--format=freeze", "--disable-pip-version-check"],
+                           capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return {}
+    pkgs = {}
+    for line in p.stdout.splitlines():
+        name, sep, version = line.strip().partition("==")
+        if sep and name:
+            pkgs[_norm(name)] = public(version.strip())
+    return pkgs
+
+
+def compare_packages(got: dict, ref: dict) -> dict:
+    """Package-by-package comparison of a pipeline image with its reference image."""
+    def keep(n):
+        return n not in PACKAGES_IGNORED and not n.startswith(PACKAGE_PREFIXES_IGNORED)
+
+    got = {n: v for n, v in got.items() if keep(n)}
+    ref = {n: v for n, v in ref.items() if keep(n)}
+    common = sorted(set(got) & set(ref))
+    return {
+        "reference": len(ref),
+        "same": {n: got[n] for n in common if got[n] == ref[n]},
+        "different": {n: [got[n], ref[n]] for n in common if got[n] != ref[n]},   # [pipeline, reference]
+        "missing": sorted(set(ref) - set(got)),   # in the reference image, not in the pipeline's
+        "extra": sorted(set(got) - set(ref)),
+    }
+
+
+def packages_cell(c: dict) -> str:
+    if not c or not c.get("reference"):
+        return "-"
+    same = len(c["same"])
+    return f"{same}/{c['reference']} same ({100 * same // c['reference']}%)"
+
+
 def run_smoke(image: str, smoke: Path) -> tuple[bool, str]:
     """Pipes the reference smoke test into `image`, without network. (passed, last lines)."""
     try:
@@ -160,7 +214,8 @@ def compare(field_name: str, got: dict, want: dict) -> str:
     w = want.get(field_name) if field_name == "python" else public(want.get(field_name))
     if g == w:
         return f"{g} ✅"
-    return f"{g or 'missing'} ❌ (ref {w})"
+    # a different version is not a failure (the smoke test decides): no ❌, only the reference's version
+    return f"{g or 'missing'} (ref {w})"
 
 
 # ---------------------------------------------------------------- one repository
@@ -223,10 +278,14 @@ def evaluate_one(name: str, url: str, commit: str, mode: str, skip_build: bool) 
     except Exception as e:  # noqa: BLE001 - one repository's failure must not stop the others
         result.build_note = f"pipeline error: {type(e).__name__}: {e}"[:300]
     ref = f"tml-ref/{name}:latest"
+    ref_packages = {}
     if image_exists(ref):
         result.reference_versions = probe_versions(ref)
+        ref_packages = probe_packages(ref)
     if result.built:
         result.versions = probe_versions(result.image)
+        if ref_packages:
+            result.packages = compare_packages(probe_packages(result.image), ref_packages)
         print(f"--- {name}: smoke test in {result.image}")
         result.smoke_passed, result.smoke_tail = run_smoke(result.image, REFERENCES / name / "smoke.py")
         print(result.smoke_tail)
@@ -237,8 +296,8 @@ def evaluate_one(name: str, url: str, commit: str, mode: str, skip_build: bool) 
 # ---------------------------------------------------------------- report
 
 def report(results: list[Result]) -> str:
-    rows = ["| Repo | Mode | Builds | Python | torch | torchvision | Smoke test | Notes |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    rows = ["| Repo | Mode | Builds | Python | torch | torchvision | Packages vs reference | Smoke test | Notes |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for r in results:
         smoke = "-" if r.smoke_passed is None else ("✅ pass" if r.smoke_passed else "❌ fail")
         note = r.build_note
@@ -248,10 +307,57 @@ def report(results: list[Result]) -> str:
         rows.append(f"| {r.name} | {mode} | {'✅' if r.built else '❌'} | "
                     f"{compare('python', r.versions, r.reference_versions)} | "
                     f"{compare('torch', r.versions, r.reference_versions)} | "
-                    f"{compare('torchvision', r.versions, r.reference_versions)} | {smoke} | "
+                    f"{compare('torchvision', r.versions, r.reference_versions)} | "
+                    f"{packages_cell(r.packages)} | {smoke} | "
                     f"{note.replace('|', '/')} |")
     passed = sum(1 for r in results if r.smoke_passed)
-    return "\n".join(rows) + f"\n\n**{passed} of {len(results)}** pipeline images pass the reference smoke test.\n"
+    text = "\n".join(rows) + f"\n\n**{passed} of {len(results)}** pipeline images pass the reference smoke test.\n"
+    text += ("\n✅ = same version as the hand-made reference. \"(ref X)\" = the pipeline installed another version "
+             "than the reference; that is not a failure: the smoke test shows whether the code runs.\n")
+    details = [package_details(r) for r in results if r.packages.get("reference")]
+    if details:
+        text += "\n## Package differences from the reference image\n\n" + "\n".join(details)
+    return text
+
+
+def _label(r: Result) -> str:
+    return f"{r.name} / {r.mode}" + (f" ({r.model})" if r.model else "")
+
+
+def package_details(r: Result) -> str:
+    c = r.packages
+    lines = [f"**{_label(r)}**: {packages_cell(c)}"]
+    if c["different"]:
+        lines.append("- different version (pipeline vs reference): "
+                     + ", ".join(f"{n} {g} vs {w}" for n, (g, w) in sorted(c["different"].items())))
+    if c["missing"]:
+        lines.append("- in the reference, not in the pipeline image: " + ", ".join(c["missing"]))
+    if c["extra"]:
+        lines.append(f"- extra in the pipeline image: {len(c['extra'])} (" + ", ".join(c["extra"][:12])
+                     + (", ..." if len(c["extra"]) > 12 else "") + ")")
+    return "\n".join(lines) + "\n"
+
+
+def packages_csv(results: list[Result]) -> str:
+    """One line per (row, package): spreadsheet-ready validation data."""
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["repo", "mode", "model", "package", "pipeline_version", "reference_version", "status"])
+    for r in results:
+        c = r.packages
+        if not c.get("reference"):
+            continue
+        for n, v in sorted(c["same"].items()):
+            w.writerow([r.name, r.mode, r.model, n, v, v, "same"])
+        for n, (g, ref) in sorted(c["different"].items()):
+            w.writerow([r.name, r.mode, r.model, n, g, ref, "different"])
+        for n in c["missing"]:
+            w.writerow([r.name, r.mode, r.model, n, "", "", "missing"])
+        for n in c["extra"]:
+            w.writerow([r.name, r.mode, r.model, n, "", "", "extra"])
+    return buf.getvalue()
 
 
 def merge(new: list[Result], path: Path) -> list[Result]:
@@ -279,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--clean", action="store_true", help="remove the pipeline images at the end")
     p.add_argument("--fresh", action="store_true", help="forget the results of earlier runs")
     p.add_argument("--model", default="", help="agent mode: the LLM to use (sets LLM_MODEL), e.g. qwen3.6:27b")
-    p.add_argument("--provider", default="", help="agent mode: rcac or openai (sets LLM_PROVIDER)")
+    p.add_argument("--provider", default="", help="agent mode: rcac, openai or anthropic (sets LLM_PROVIDER)")
     args = p.parse_args(argv)
 
     repos = read_repos()
@@ -308,10 +414,11 @@ def main(argv: list[str] | None = None) -> int:
     stamp = time.strftime("%Y-%m-%d %H:%M")
     (OUT / "results.md").write_text(f"# Pipeline vs reference (updated {stamp})\n\n{table}")
     (OUT / "results.json").write_text(json.dumps([asdict(r) for r in rows], indent=1))
+    (OUT / "packages.csv").write_text(packages_csv(rows))
     print("\nthis run:\n" + report(results))
     if len(rows) > len(results):
         print("all results so far:\n" + table)
-    print(f"saved: {OUT / 'results.md'}, {OUT / 'results.json'}")
+    print(f"saved: {OUT / 'results.md'}, {OUT / 'results.json'}, {OUT / 'packages.csv'}")
 
     if args.clean:
         for r in results:
